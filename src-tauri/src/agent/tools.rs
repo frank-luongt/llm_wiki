@@ -51,6 +51,12 @@ const GBRAIN_BASE_URL: &str = "http://127.0.0.1:3131";
 const GBRAIN_KEYCHAIN_ACCOUNT: &str = "llm-wiki-founder-read";
 const GBRAIN_CLIENT_ID_SERVICE: &str = "com.faosx.gbrain.oauth.client-id";
 const GBRAIN_CLIENT_SECRET_SERVICE: &str = "com.faosx.gbrain.oauth.client-secret";
+const FOUNDER_GBRAIN_SOURCES: [&str; 4] = [
+    "frankbrain",
+    "default",
+    "gdrive-workspaces",
+    "faos-projects",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -536,7 +542,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                     "query": { "type": "string" },
                     "sourceId": {
                         "type": "string",
-                        "enum": ["frankbrain", "default"],
+                        "enum": ["frankbrain", "default", "gdrive-workspaces", "faos-projects"],
                         "default": "frankbrain"
                     },
                     "topK": { "type": "integer", "minimum": 1, "maximum": 10 }
@@ -1281,8 +1287,11 @@ pub async fn run_gbrain_query(
     source_id: &str,
     top_k: usize,
 ) -> Result<FounderRetrievalOutput, String> {
-    if !matches!(source_id, "default" | "frankbrain") {
-        return Err("gbrain.query sourceId must be default or frankbrain".to_string());
+    if !FOUNDER_GBRAIN_SOURCES.contains(&source_id) {
+        return Err(
+            "gbrain.query sourceId must be frankbrain, default, gdrive-workspaces, or faos-projects"
+                .to_string(),
+        );
     }
     let client_id = keychain_secret(GBRAIN_CLIENT_ID_SERVICE).await?;
     let client_secret = keychain_secret(GBRAIN_CLIENT_SECRET_SERVICE).await?;
@@ -3099,6 +3108,15 @@ mod tests {
         assert!(names.contains(&"workspace.write_file".to_string()));
         assert!(names.contains(&"workspace.append_file".to_string()));
         assert!(names.contains(&"shell.exec".to_string()));
+    }
+
+    #[test]
+    fn founder_gbrain_source_allowlist_is_scoped_to_approved_local_sources() {
+        assert!(FOUNDER_GBRAIN_SOURCES.contains(&"frankbrain"));
+        assert!(FOUNDER_GBRAIN_SOURCES.contains(&"default"));
+        assert!(FOUNDER_GBRAIN_SOURCES.contains(&"gdrive-workspaces"));
+        assert!(FOUNDER_GBRAIN_SOURCES.contains(&"faos-projects"));
+        assert!(!FOUNDER_GBRAIN_SOURCES.contains(&"untrusted-source"));
     }
 
     #[test]
