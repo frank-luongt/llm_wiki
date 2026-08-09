@@ -1366,6 +1366,18 @@ pub async fn run_gbrain_query(
         .ok_or_else(|| "gbrain.query returned no content".to_string())?;
     let payload: Value = serde_json::from_str(tool_text)
         .map_err(|err| format!("gbrain.query returned invalid JSON content: {err}"))?;
+    parse_founder_retrieval_payload(&payload, source_id, top_k)
+}
+
+/// Normalize the documented object envelopes and gbrain's current compact
+/// query response (a top-level result array) into one founder retrieval
+/// contract. Keeping this parsing independent from HTTP makes a response
+/// shape change testable before it becomes an `unavailable` answer in the UI.
+fn parse_founder_retrieval_payload(
+    payload: &Value,
+    source_id: &str,
+    top_k: usize,
+) -> Result<FounderRetrievalOutput, String> {
     if payload.get("error").is_some() {
         return Err(format!(
             "gbrain.query failed: {}",
@@ -1376,10 +1388,12 @@ pub async fn run_gbrain_query(
         ));
     }
 
-    let pages = payload
-        .get("pages")
-        .or_else(|| payload.get("results"))
-        .and_then(Value::as_array);
+    let pages = payload.as_array().or_else(|| {
+        payload
+            .get("pages")
+            .or_else(|| payload.get("results"))
+            .and_then(Value::as_array)
+    });
     let mut references = Vec::new();
     if let Some(pages) = pages {
         for page in pages.iter().take(top_k.clamp(1, 10)) {
@@ -1397,6 +1411,8 @@ pub async fn run_gbrain_query(
                 .get("snippet")
                 .or_else(|| page.get("compiled_truth"))
                 .or_else(|| page.get("content"))
+                .or_else(|| page.get("evidence"))
+                .or_else(|| page.get("chunk_text"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let evidence_path = page
@@ -1448,6 +1464,8 @@ pub async fn run_gbrain_query(
         .get("confidence")
         .and_then(Value::as_f64)
         .or_else(|| payload.pointer("/pages/0/score").and_then(Value::as_f64))
+        .or_else(|| payload.pointer("/results/0/score").and_then(Value::as_f64))
+        .or_else(|| payload.pointer("/0/score").and_then(Value::as_f64))
         .unwrap_or(0.5)
         .clamp(0.0, 1.0);
     Ok(FounderRetrievalOutput {
@@ -3128,6 +3146,30 @@ mod tests {
         assert!(FOUNDER_GBRAIN_SOURCES.contains(&"gdrive-workspaces"));
         assert!(FOUNDER_GBRAIN_SOURCES.contains(&"faos-projects"));
         assert!(!FOUNDER_GBRAIN_SOURCES.contains(&"untrusted-source"));
+    }
+
+    #[test]
+    fn founder_gbrain_query_accepts_current_compact_array_response() {
+        let payload = serde_json::json!([
+            {
+                "slug": "concepts/provider-abstraction",
+                "source_id": "frankbrain",
+                "title": "Provider Abstraction",
+                "chunk_text": "One provider-neutral interface routes supported models.",
+                "score": 0.91
+            }
+        ]);
+
+        let result = parse_founder_retrieval_payload(&payload, "frankbrain", 3).unwrap();
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.references[0].path, "wiki/concepts/provider-abstraction.md");
+        assert_eq!(
+            result.references[0].evidence_snippet,
+            "One provider-neutral interface routes supported models."
+        );
+        assert_eq!(result.confidence, 0.91);
     }
 
     #[test]
