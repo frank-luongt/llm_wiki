@@ -1340,7 +1340,11 @@ pub async fn run_gbrain_query(
                     "source_id": source_id,
                     "limit": top_k.clamp(1, 10),
                     "expand": false,
-                    "detail": "low",
+                    // `low` returns compiled truth only and can omit the
+                    // evidence snippet for generated extraction pages. The
+                    // UI must receive source text to synthesize a grounded
+                    // answer and render a meaningful citation.
+                    "detail": "medium",
                     "adaptive_return": true
                 }
             }
