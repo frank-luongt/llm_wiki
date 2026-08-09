@@ -2667,8 +2667,12 @@ fn founder_references_match_query(
         .collect::<BTreeSet<_>>();
     !terms.is_empty()
         && references.iter().any(|reference| {
-            let title = reference.title.to_lowercase();
-            terms.iter().any(|term| title.contains(term))
+            let searchable = format!(
+                "{} {}",
+                reference.title.to_lowercase(),
+                reference.evidence_snippet.to_lowercase()
+            );
+            terms.iter().any(|term| searchable.contains(term))
         })
 }
 
@@ -4269,6 +4273,18 @@ mod tests {
         ));
         assert!(founder_references_match_query(
             &matching,
+            "What is the Pivotal digital transformation forum? Cite the evidence."
+        ));
+
+        let snippet_match = vec![tools::FounderRetrievalReference {
+            title: "Imported document".to_string(),
+            path: "gbrain://gdrive-workspaces/pivotal".to_string(),
+            source: "gdrive-workspaces".to_string(),
+            version_or_hash: "unknown".to_string(),
+            evidence_snippet: "Pivotal Digital Transformation Forum".to_string(),
+        }];
+        assert!(founder_references_match_query(
+            &snippet_match,
             "What is the Pivotal digital transformation forum? Cite the evidence."
         ));
     }
