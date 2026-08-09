@@ -51,7 +51,7 @@ const GBRAIN_BASE_URL: &str = "http://127.0.0.1:3131";
 const GBRAIN_KEYCHAIN_ACCOUNT: &str = "llm-wiki-founder-read";
 const GBRAIN_CLIENT_ID_SERVICE: &str = "com.faosx.gbrain.oauth.client-id";
 const GBRAIN_CLIENT_SECRET_SERVICE: &str = "com.faosx.gbrain.oauth.client-secret";
-const FOUNDER_GBRAIN_SOURCES: [&str; 4] = [
+pub const FOUNDER_GBRAIN_SOURCES: [&str; 4] = [
     "frankbrain",
     "default",
     "gdrive-workspaces",

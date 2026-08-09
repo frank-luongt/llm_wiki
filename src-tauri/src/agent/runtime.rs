@@ -774,93 +774,123 @@ impl AgentRuntime {
                 .get("gbrain.query")
                 .map(String::as_str)
                 .unwrap_or(message);
-            tool_emit_event(
-                &mut tool_events,
-                &mut events,
-                &event_sink,
-                AgentToolEvent {
-                    tool: "gbrain.query".to_string(),
-                    status: "started".to_string(),
-                    detail: Some(gbrain_query.to_string()),
-                },
-            );
-            emit_event(
-                &mut events,
-                &event_sink,
-                AgentEvent::tool_start("gbrain.query", Some(gbrain_query.to_string())),
-            );
-            let result = execute_tool_with_cancellation(
-                tool_registry.execute(
-                    "gbrain.query",
-                    serde_json::json!({
-                        "query": gbrain_query,
-                        "sourceId": "frankbrain",
-                        "topK": request.top_k.unwrap_or(DEFAULT_CHAT_SEARCH_RESULTS)
-                    }),
-                    self.tool_context(),
-                ),
-                cancellation.as_ref(),
-            )
-            .await
-            .and_then(|value| {
-                serde_json::from_value::<tools::FounderRetrievalOutput>(value)
-                    .map_err(|err| format!("Invalid gbrain.query result: {err}"))
-            });
-            match result {
-                Ok(founder) => {
-                    let count = founder.references.len();
-                    for item in founder.references {
-                        let reference = AgentReference {
-                            title: item.title,
-                            path: item.path,
-                            kind: "gbrain".to_string(),
-                            snippet: Some(format!(
-                                "[{} @ {}] {}",
-                                item.source, item.version_or_hash, item.evidence_snippet
-                            )),
-                            score: Some(founder.confidence),
-                            knowledge_context: None,
-                        };
-                        push_unique_reference(&mut references, &mut events, &event_sink, reference);
+            // Keep the founder-brain contract deterministic: human-approved
+            // canonical content first, then its readable projection, then
+            // local evidence sources. Stop at the first source that can
+            // ground an answer; do not blend unrelated evidence sources.
+            let mut gbrain_grounded = false;
+            for source_id in tools::FOUNDER_GBRAIN_SOURCES {
+                tool_emit_event(
+                    &mut tool_events,
+                    &mut events,
+                    &event_sink,
+                    AgentToolEvent {
+                        tool: "gbrain.query".to_string(),
+                        status: "started".to_string(),
+                        detail: Some(format!("{source_id}: {gbrain_query}")),
+                    },
+                );
+                emit_event(
+                    &mut events,
+                    &event_sink,
+                    AgentEvent::tool_start(
+                        "gbrain.query",
+                        Some(format!("{source_id}: {gbrain_query}")),
+                    ),
+                );
+                let result = execute_tool_with_cancellation(
+                    tool_registry.execute(
+                        "gbrain.query",
+                        serde_json::json!({
+                            "query": gbrain_query,
+                            "sourceId": source_id,
+                            "topK": request.top_k.unwrap_or(DEFAULT_CHAT_SEARCH_RESULTS)
+                        }),
+                        self.tool_context(),
+                    ),
+                    cancellation.as_ref(),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<tools::FounderRetrievalOutput>(value)
+                        .map_err(|err| format!("Invalid gbrain.query result: {err}"))
+                });
+                match result {
+                    Ok(founder) => {
+                        let count = founder.references.len();
+                        let usable = founder.status != "unavailable"
+                            && (count > 0 || !founder.answer.trim().is_empty());
+                        for item in founder.references {
+                            let reference = AgentReference {
+                                title: item.title,
+                                path: item.path,
+                                kind: "gbrain".to_string(),
+                                snippet: Some(format!(
+                                    "[{} @ {}] {}",
+                                    item.source, item.version_or_hash, item.evidence_snippet
+                                )),
+                                score: Some(founder.confidence),
+                                knowledge_context: None,
+                            };
+                            push_unique_reference(
+                                &mut references,
+                                &mut events,
+                                &event_sink,
+                                reference,
+                            );
+                        }
+                        if !founder.answer.trim().is_empty() {
+                            retrieval_parts.push(founder.answer);
+                        }
+                        tool_emit_event(
+                            &mut tool_events,
+                            &mut events,
+                            &event_sink,
+                            AgentToolEvent {
+                                tool: "gbrain.query".to_string(),
+                                status: "completed".to_string(),
+                                detail: Some(format!(
+                                    "{source_id}: {count} source-scoped result(s)"
+                                )),
+                            },
+                        );
+                        emit_event(
+                            &mut events,
+                            &event_sink,
+                            AgentEvent::tool_end(
+                                "gbrain.query",
+                                Some(format!("{source_id}: {count} result(s)")),
+                            ),
+                        );
+                        if usable {
+                            gbrain_grounded = true;
+                            break;
+                        }
                     }
-                    if founder.status == "unavailable" {
-                        retrieval_parts.push("unavailable".to_string());
-                    } else if !founder.answer.trim().is_empty() {
-                        retrieval_parts.push(founder.answer);
+                    Err(err) => {
+                        tool_emit_event(
+                            &mut tool_events,
+                            &mut events,
+                            &event_sink,
+                            AgentToolEvent {
+                                tool: "gbrain.query".to_string(),
+                                status: "failed".to_string(),
+                                detail: Some(format!("{source_id}: {err}")),
+                            },
+                        );
+                        emit_event(
+                            &mut events,
+                            &event_sink,
+                            AgentEvent::tool_end(
+                                "gbrain.query",
+                                Some(format!("{source_id}: failed: {err}")),
+                            ),
+                        );
                     }
-                    tool_emit_event(
-                        &mut tool_events,
-                        &mut events,
-                        &event_sink,
-                        AgentToolEvent {
-                            tool: "gbrain.query".to_string(),
-                            status: "completed".to_string(),
-                            detail: Some(format!("{count} source-scoped result(s)")),
-                        },
-                    );
-                    emit_event(
-                        &mut events,
-                        &event_sink,
-                        AgentEvent::tool_end("gbrain.query", Some(format!("{count} result(s)"))),
-                    );
                 }
-                Err(err) => {
-                    tool_emit_event(
-                        &mut tool_events,
-                        &mut events,
-                        &event_sink,
-                        AgentToolEvent {
-                            tool: "gbrain.query".to_string(),
-                            status: "failed".to_string(),
-                            detail: Some(err.clone()),
-                        },
-                    );
-                    emit_event(
-                        &mut events,
-                        &event_sink,
-                        AgentEvent::tool_end("gbrain.query", Some(format!("failed: {err}"))),
-                    );
-                }
+            }
+            if !gbrain_grounded {
+                retrieval_parts.push("unavailable".to_string());
             }
         }
 
