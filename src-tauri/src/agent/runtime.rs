@@ -825,32 +825,35 @@ impl AgentRuntime {
                         // governed evidence sources unless a returned title
                         // actually overlaps a substantive query term.
                         let usable = founder.status != "unavailable"
-                            && (!founder.answer.trim().is_empty()
-                                || founder_references_match_query(
-                                    &founder.references,
-                                    gbrain_query,
-                                ));
-                        for item in founder.references {
-                            let reference = AgentReference {
-                                title: item.title,
-                                path: item.path,
-                                kind: "gbrain".to_string(),
-                                snippet: Some(format!(
-                                    "[{} @ {}] {}",
-                                    item.source, item.version_or_hash, item.evidence_snippet
-                                )),
-                                score: Some(founder.confidence),
-                                knowledge_context: None,
-                            };
-                            push_unique_reference(
-                                &mut references,
-                                &mut events,
-                                &event_sink,
-                                reference,
-                            );
-                        }
-                        if !founder.answer.trim().is_empty() {
-                            retrieval_parts.push(founder.answer);
+                            && founder_references_match_query(&founder.references, gbrain_query);
+                        // Preserve the activity record for every governed
+                        // source queried, but only pass relevant evidence to
+                        // synthesis and citations. A vector neighbour is not
+                        // evidence for this question just because it has a
+                        // generated non-empty summary.
+                        if usable {
+                            for item in founder.references {
+                                let reference = AgentReference {
+                                    title: item.title,
+                                    path: item.path,
+                                    kind: "gbrain".to_string(),
+                                    snippet: Some(format!(
+                                        "[{} @ {}] {}",
+                                        item.source, item.version_or_hash, item.evidence_snippet
+                                    )),
+                                    score: Some(founder.confidence),
+                                    knowledge_context: None,
+                                };
+                                push_unique_reference(
+                                    &mut references,
+                                    &mut events,
+                                    &event_sink,
+                                    reference,
+                                );
+                            }
+                            if !founder.answer.trim().is_empty() {
+                                retrieval_parts.push(founder.answer);
+                            }
                         }
                         tool_emit_event(
                             &mut tool_events,
