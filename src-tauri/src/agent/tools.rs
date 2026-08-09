@@ -53,9 +53,9 @@ const GBRAIN_CLIENT_ID_SERVICE: &str = "com.faosx.gbrain.oauth.client-id";
 const GBRAIN_CLIENT_SECRET_SERVICE: &str = "com.faosx.gbrain.oauth.client-secret";
 pub const FOUNDER_GBRAIN_SOURCES: [&str; 4] = [
     "frankbrain",
-    "default",
     "gdrive-workspaces",
     "faos-projects",
+    "default",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3164,7 +3164,10 @@ mod tests {
 
         assert_eq!(result.status, "ok");
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].path, "wiki/concepts/provider-abstraction.md");
+        assert_eq!(
+            result.references[0].path,
+            "wiki/concepts/provider-abstraction.md"
+        );
         assert_eq!(
             result.references[0].evidence_snippet,
             "One provider-neutral interface routes supported models."

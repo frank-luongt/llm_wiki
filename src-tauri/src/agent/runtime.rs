@@ -818,8 +818,18 @@ impl AgentRuntime {
                 match result {
                     Ok(founder) => {
                         let count = founder.references.len();
+                        // A vector search returns a nearest neighbour even
+                        // for an unrelated question. Canonical precedence is
+                        // therefore "first sufficient evidence", not simply
+                        // "first non-empty result": keep searching the
+                        // governed evidence sources unless a returned title
+                        // actually overlaps a substantive query term.
                         let usable = founder.status != "unavailable"
-                            && (count > 0 || !founder.answer.trim().is_empty());
+                            && (!founder.answer.trim().is_empty()
+                                || founder_references_match_query(
+                                    &founder.references,
+                                    gbrain_query,
+                                ));
                         for item in founder.references {
                             let reference = AgentReference {
                                 title: item.title,
@@ -2639,6 +2649,26 @@ fn founder_gbrain_source_precedence() -> &'static [&'static str] {
     &tools::FOUNDER_GBRAIN_SOURCES
 }
 
+fn founder_references_match_query(
+    references: &[tools::FounderRetrievalReference],
+    query: &str,
+) -> bool {
+    const STOP_WORDS: &[&str] = &[
+        "about", "answer", "cite", "does", "evidence", "explain", "from", "have", "page", "tell",
+        "that", "the", "this", "what", "which", "with",
+    ];
+    let terms = query
+        .split(|character: char| !character.is_alphanumeric())
+        .map(|term| term.to_lowercase())
+        .filter(|term| term.len() >= 4 && !STOP_WORDS.contains(&term.as_str()))
+        .collect::<BTreeSet<_>>();
+    !terms.is_empty()
+        && references.iter().any(|reference| {
+            let title = reference.title.to_lowercase();
+            terms.iter().any(|term| title.contains(term))
+        })
+}
+
 fn agent_structured_max_tokens(has_skills: bool) -> u32 {
     if has_skills {
         AGENT_SKILL_STRUCTURED_MAX_TOKENS
@@ -4206,11 +4236,38 @@ mod tests {
             founder_gbrain_source_precedence(),
             [
                 "frankbrain",
-                "default",
                 "gdrive-workspaces",
-                "faos-projects"
+                "faos-projects",
+                "default"
             ],
         );
+    }
+
+    #[test]
+    fn founder_precedence_requires_title_evidence_not_any_vector_neighbor() {
+        let unrelated = vec![tools::FounderRetrievalReference {
+            title: "Provider Abstraction".to_string(),
+            path: "wiki/concepts/provider-abstraction.md".to_string(),
+            source: "frankbrain".to_string(),
+            version_or_hash: "unknown".to_string(),
+            evidence_snippet: String::new(),
+        }];
+        let matching = vec![tools::FounderRetrievalReference {
+            title: "Pivotal Digital Transformation Forum".to_string(),
+            path: "gbrain://gdrive-workspaces/pivotal".to_string(),
+            source: "gdrive-workspaces".to_string(),
+            version_or_hash: "unknown".to_string(),
+            evidence_snippet: String::new(),
+        }];
+
+        assert!(!founder_references_match_query(
+            &unrelated,
+            "What is the Pivotal digital transformation forum? Cite the evidence."
+        ));
+        assert!(founder_references_match_query(
+            &matching,
+            "What is the Pivotal digital transformation forum? Cite the evidence."
+        ));
     }
     use crate::agent::types::{AgentMode, AgentToolOptions};
 
