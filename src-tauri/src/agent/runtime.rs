@@ -100,6 +100,12 @@ struct AgentLoopAction {
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    notebook_id: Option<String>,
+    #[serde(default)]
+    sensitivity: Option<String>,
+    #[serde(default)]
     skill: Option<String>,
     #[serde(default)]
     command: Option<String>,
@@ -2264,6 +2270,38 @@ impl AgentRuntime {
                     "includeContent": action.include_content.or(request.include_content).unwrap_or(false),
                 }))
             }
+            "notebooklm.query" => {
+                let query = action
+                    .query
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|query| !query.is_empty())
+                    .ok_or_else(|| "notebooklm.query requires query".to_string())?;
+                let profile = action
+                    .profile
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "notebooklm.query requires profile".to_string())?;
+                let notebook_id = action
+                    .notebook_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "notebooklm.query requires notebookId".to_string())?;
+                let sensitivity = action
+                    .sensitivity
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "notebooklm.query requires sensitivity".to_string())?;
+                Ok(serde_json::json!({
+                    "query": query,
+                    "profile": profile,
+                    "notebookId": notebook_id,
+                    "sensitivity": sensitivity,
+                }))
+            }
             "wiki.read_page" => {
                 let path = action
                     .path
@@ -2404,6 +2442,43 @@ impl AgentRuntime {
                         founder.sensitivity, founder.confidence
                     ))
                 }
+            }
+            "notebooklm.query" => {
+                let notebook: tools::NotebookLmRetrievalOutput = serde_json::from_value(value)
+                    .map_err(|err| format!("Invalid notebooklm.query result: {err}"))?;
+                if notebook.status == "unavailable" {
+                    return Ok(format!(
+                        "unavailable: NotebookLM profile={} notebook={}",
+                        notebook.profile, notebook.notebook_id
+                    ));
+                }
+                let title = notebook
+                    .notebook_name
+                    .clone()
+                    .unwrap_or_else(|| notebook.notebook_id.clone());
+                let path = notebook.notebook_url.clone().unwrap_or_else(|| {
+                    format!("notebooklm:{}/{}", notebook.profile, notebook.notebook_id)
+                });
+                push_unique_reference(
+                    references,
+                    events,
+                    event_sink,
+                    AgentReference {
+                        title,
+                        path,
+                        kind: "notebooklm".to_string(),
+                        snippet: Some(trim_chars(&notebook.answer, 500)),
+                        score: Some(notebook.confidence),
+                        knowledge_context: None,
+                    },
+                );
+                Ok(format!(
+                    "NotebookLM answer from profile={} notebook={} sensitivity={}\n{}",
+                    notebook.profile,
+                    notebook.notebook_id,
+                    notebook.sensitivity,
+                    trim_chars(&notebook.answer, 4_000)
+                ))
             }
             "wiki.read_page" => {
                 let path = value
@@ -2982,6 +3057,7 @@ fn is_agent_retrieval_tool(tool: &str) -> bool {
         "wiki.search"
             | "wiki.read_page"
             | "gbrain.query"
+            | "notebooklm.query"
             | "source.search"
             | "graph.search"
             | "web.search"
@@ -3164,6 +3240,7 @@ fn build_agent_loop_user(
         } else {
             out.push_str("- wiki.search: retrieve wiki pages for factual or topical questions.\n");
             out.push_str("- gbrain.query: read-only founder evidence fallback. Use only after published and projected wiki pages are insufficient.\n");
+            out.push_str("- notebooklm.query: query an explicitly named NotebookLM notebook only when the user requests it. Include profile, notebookId, and sensitivity; local_only content is forbidden. personal accepts founder_private, faosx accepts faosx_confidential, and dual_approved/shareable may use either approved profile.\n");
             out.push_str("- wiki.read_page: read a specific wiki markdown page by path.\n");
             out.push_str("- source.search: search raw source snippets.\n");
             out.push_str("- graph.search: retrieve relationships, neighbors, backlinks, dependencies, and connections between entities. Prefer it for relational questions and query with concise entity or concept names.\n");
@@ -3278,6 +3355,7 @@ fn is_agent_loop_tool_name(value: &str) -> bool {
             | "wiki.read_page"
             | "wiki.write_page"
             | "gbrain.query"
+            | "notebooklm.query"
             | "source.search"
             | "graph.search"
             | "web.search"
@@ -3537,8 +3615,8 @@ fn render_observations(observations: &[AgentObservation]) -> String {
 
 fn summarize_tool_input(tool: &str, input: &Value) -> Option<String> {
     match tool {
-        "wiki.search" | "gbrain.query" | "source.search" | "graph.search" | "web.search"
-        | "anytxt.search" => input
+        "wiki.search" | "gbrain.query" | "notebooklm.query" | "source.search" | "graph.search"
+        | "web.search" | "anytxt.search" => input
             .get("query")
             .and_then(Value::as_str)
             .map(str::to_string),
@@ -3665,6 +3743,7 @@ fn require_tool_permission(
             "wiki.search"
                 | "wiki.read_page"
                 | "gbrain.query"
+                | "notebooklm.query"
                 | "graph.search"
                 | "web.search"
                 | "anytxt.search"
@@ -3686,6 +3765,13 @@ fn require_tool_permission(
                 return Err("gbrain.query is disabled for this turn".to_string());
             }
             permission_policy.require(AgentCapability::ReadSource)
+        }
+        "notebooklm.query" => {
+            if !request.tools.wiki {
+                return Err("notebooklm.query is disabled for this turn".to_string());
+            }
+            permission_policy.require(AgentCapability::ReadSource)?;
+            permission_policy.require(AgentCapability::Network)
         }
         "wiki.read_page" | "graph.search" => {
             if !request.tools.wiki {
