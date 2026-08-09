@@ -51,6 +51,7 @@ const GBRAIN_BASE_URL: &str = "http://127.0.0.1:3131";
 const GBRAIN_KEYCHAIN_ACCOUNT: &str = "llm-wiki-founder-read";
 const GBRAIN_CLIENT_ID_SERVICE: &str = "com.faosx.gbrain.oauth.client-id";
 const GBRAIN_CLIENT_SECRET_SERVICE: &str = "com.faosx.gbrain.oauth.client-secret";
+const NOTEBOOKLM_QUERY_TIMEOUT_SECS: u64 = 150;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +254,26 @@ impl ToolRegistry for BuiltinToolRegistry {
                     )
                     .map_err(|err| format!("Failed to serialize gbrain.query result: {err}"))
                 }
+                "notebooklm.query" => {
+                    let query = tool_query(&input, "notebooklm.query")?;
+                    let profile = input
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "notebooklm.query requires profile".to_string())?;
+                    let notebook_id = input
+                        .get("notebookId")
+                        .or_else(|| input.get("notebook_id"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "notebooklm.query requires notebookId".to_string())?;
+                    let sensitivity = input
+                        .get("sensitivity")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "notebooklm.query requires sensitivity".to_string())?;
+                    serde_json::to_value(
+                        run_notebooklm_query(query, profile, notebook_id, sensitivity).await?,
+                    )
+                    .map_err(|err| format!("Failed to serialize notebooklm.query result: {err}"))
+                }
                 "web.search" => {
                     let query = tool_query(&input, "web.search")?;
                     serde_json::to_value(
@@ -328,6 +349,20 @@ pub struct FounderRetrievalOutput {
     pub references: Vec<FounderRetrievalReference>,
     pub confidence: f64,
     pub freshness: Option<String>,
+    pub sensitivity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NotebookLmRetrievalOutput {
+    pub status: String,
+    pub answer: String,
+    pub grounding_source: String,
+    pub profile: String,
+    pub notebook_id: String,
+    pub notebook_name: Option<String>,
+    pub notebook_url: Option<String>,
+    pub confidence: f64,
     pub sensitivity: String,
 }
 
@@ -542,6 +577,25 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                     "topK": { "type": "integer", "minimum": 1, "maximum": 10 }
                 },
                 "required": ["query"]
+            })),
+        },
+        ToolSpec {
+            name: "notebooklm.query".to_string(),
+            description: "Query one explicitly named NotebookLM notebook through an isolated personal or FAOSX account profile. Use only when the user explicitly requests NotebookLM and supplies an approved sensitivity route. Never use for local_only content."
+                .to_string(),
+            effects: vec![ToolEffect::Network, ToolEffect::Read, ToolEffect::Process],
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "profile": { "type": "string", "enum": ["personal", "faosx"] },
+                    "notebookId": { "type": "string" },
+                    "sensitivity": {
+                        "type": "string",
+                        "enum": ["founder_private", "faosx_confidential", "dual_approved", "shareable"]
+                    }
+                },
+                "required": ["query", "profile", "notebookId", "sensitivity"]
             })),
         },
         ToolSpec {
@@ -1442,6 +1496,142 @@ pub async fn run_gbrain_query(
             .and_then(Value::as_str)
             .map(str::to_string),
         sensitivity: "local_only".to_string(),
+    })
+}
+
+fn notebooklm_route_allowed(profile: &str, sensitivity: &str) -> bool {
+    match profile {
+        "personal" => matches!(
+            sensitivity,
+            "founder_private" | "dual_approved" | "shareable"
+        ),
+        "faosx" => matches!(
+            sensitivity,
+            "faosx_confidential" | "dual_approved" | "shareable"
+        ),
+        _ => false,
+    }
+}
+
+fn notebooklm_skill_dir() -> Result<PathBuf, String> {
+    if let Some(configured) = std::env::var_os("NOTEBOOKLM_SKILL_DIR") {
+        return Ok(PathBuf::from(configured));
+    }
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| "NOTEBOOKLM_SKILL_DIR is not set and HOME is unavailable".to_string())?;
+    Ok(PathBuf::from(home)
+        .join(".claude")
+        .join("skills")
+        .join("notebooklm"))
+}
+
+fn validate_notebook_id(notebook_id: &str) -> Result<&str, String> {
+    let notebook_id = notebook_id.trim();
+    if notebook_id.is_empty()
+        || notebook_id.len() > 128
+        || !notebook_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(
+            "notebooklm.query notebookId must contain only letters, numbers, hyphens, or underscores"
+                .to_string(),
+        );
+    }
+    Ok(notebook_id)
+}
+
+pub async fn run_notebooklm_query(
+    query: &str,
+    profile: &str,
+    notebook_id: &str,
+    sensitivity: &str,
+) -> Result<NotebookLmRetrievalOutput, String> {
+    let query = query.trim();
+    if query.is_empty() || query.chars().count() > 4_000 {
+        return Err("notebooklm.query query must contain 1 to 4000 characters".to_string());
+    }
+    let notebook_id = validate_notebook_id(notebook_id)?;
+    if !notebooklm_route_allowed(profile, sensitivity) {
+        return Err(format!(
+            "notebooklm.query blocks sensitivity {sensitivity} from profile {profile}"
+        ));
+    }
+
+    let skill_dir = notebooklm_skill_dir()?;
+    let runner = skill_dir.join("scripts").join("run.py");
+    let bridge = skill_dir.join("scripts").join("bridge.py");
+    if !runner.is_file() || !bridge.is_file() {
+        return Err(format!(
+            "NotebookLM skill bridge is not installed at {}",
+            skill_dir.display()
+        ));
+    }
+
+    let mut command = Command::new("python3");
+    command
+        .current_dir(&skill_dir)
+        .arg(runner)
+        .args(["--profile", profile, "bridge.py", "query", "--notebook-id"])
+        .arg(notebook_id)
+        .arg("--question")
+        .arg(query)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = timeout(
+        Duration::from_secs(NOTEBOOKLM_QUERY_TIMEOUT_SECS),
+        command.output(),
+    )
+    .await
+    .map_err(|_| {
+        format!("notebooklm.query timed out after {NOTEBOOKLM_QUERY_TIMEOUT_SECS} seconds")
+    })?
+    .map_err(|err| format!("notebooklm.query failed to start: {err}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let payload = stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .ok_or_else(|| {
+            let stderr = trim_text(&String::from_utf8_lossy(&output.stderr), 800);
+            format!("notebooklm.query returned no JSON result: {stderr}")
+        })?;
+    let status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable")
+        .to_string();
+    let answer = payload
+        .get("answer")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable")
+        .to_string();
+    if !output.status.success() && status != "unavailable" {
+        return Err(format!(
+            "notebooklm.query exited with {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    Ok(NotebookLmRetrievalOutput {
+        confidence: if status == "ok" { 0.85 } else { 0.0 },
+        status,
+        answer,
+        grounding_source: "notebooklm".to_string(),
+        profile: profile.to_string(),
+        notebook_id: notebook_id.to_string(),
+        notebook_name: payload
+            .get("notebook_name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        notebook_url: payload
+            .get("notebook_url")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        sensitivity: sensitivity.to_string(),
     })
 }
 
@@ -3091,6 +3281,7 @@ mod tests {
         assert!(names.contains(&"wiki.read_page".to_string()));
         assert!(names.contains(&"source.search".to_string()));
         assert!(names.contains(&"graph.search".to_string()));
+        assert!(names.contains(&"notebooklm.query".to_string()));
         assert!(names.contains(&"anytxt.search".to_string()));
         assert!(names.contains(&"wiki.write_page".to_string()));
         assert!(names.contains(&"llm.generate".to_string()));
@@ -3099,6 +3290,30 @@ mod tests {
         assert!(names.contains(&"workspace.write_file".to_string()));
         assert!(names.contains(&"workspace.append_file".to_string()));
         assert!(names.contains(&"shell.exec".to_string()));
+    }
+
+    #[test]
+    fn notebooklm_routes_keep_personal_and_enterprise_boundaries() {
+        assert!(notebooklm_route_allowed("personal", "founder_private"));
+        assert!(!notebooklm_route_allowed("personal", "faosx_confidential"));
+        assert!(notebooklm_route_allowed("faosx", "faosx_confidential"));
+        assert!(!notebooklm_route_allowed("faosx", "founder_private"));
+        assert!(notebooklm_route_allowed("personal", "dual_approved"));
+        assert!(notebooklm_route_allowed("faosx", "dual_approved"));
+        assert!(!notebooklm_route_allowed("personal", "local_only"));
+        assert!(!notebooklm_route_allowed("faosx", "local_only"));
+        assert!(!notebooklm_route_allowed("legacy", "shareable"));
+    }
+
+    #[test]
+    fn notebooklm_notebook_id_is_bounded_and_shell_agnostic() {
+        assert_eq!(
+            validate_notebook_id("founder-research_2026").unwrap(),
+            "founder-research_2026"
+        );
+        assert!(validate_notebook_id("../personal").is_err());
+        assert!(validate_notebook_id("founder; env").is_err());
+        assert!(validate_notebook_id("").is_err());
     }
 
     #[test]
