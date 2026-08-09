@@ -1451,12 +1451,29 @@ fn parse_founder_retrieval_payload(
             });
         }
     }
-    let answer = payload
+    let mut answer = payload
         .get("answer")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim()
         .to_string();
+    // Compact gbrain query responses are result arrays, not answer envelopes.
+    // Preserve their evidence in the retrieval context so the final local
+    // synthesis can answer from the same cited snippets instead of seeing
+    // only opaque `gbrain://` reference paths.
+    if answer.is_empty() && !references.is_empty() {
+        answer = references
+            .iter()
+            .filter(|reference| !reference.evidence_snippet.trim().is_empty())
+            .map(|reference| {
+                format!(
+                    "{} [{}]: {}",
+                    reference.title, reference.source, reference.evidence_snippet
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
     if references.is_empty() && answer.is_empty() {
         return Ok(unavailable_gbrain_result());
     }
@@ -3172,6 +3189,10 @@ mod tests {
             result.references[0].evidence_snippet,
             "One provider-neutral interface routes supported models."
         );
+        assert!(result.answer.contains("Provider Abstraction [frankbrain]"));
+        assert!(result
+            .answer
+            .contains("One provider-neutral interface routes supported models."));
         assert_eq!(result.confidence, 0.91);
     }
 
