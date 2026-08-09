@@ -1399,6 +1399,11 @@ pub async fn run_gbrain_query(
                 .or_else(|| page.get("content"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            let evidence_path = page
+                .get("source_path")
+                .or_else(|| page.get("source_uri"))
+                .or_else(|| page.pointer("/frontmatter/source_path"))
+                .and_then(Value::as_str);
             references.push(FounderRetrievalReference {
                 title: page
                     .get("title")
@@ -1408,10 +1413,16 @@ pub async fn run_gbrain_query(
                 // Resolve citations to the local readable layer whenever one
                 // exists. `default` is the generated projection while the
                 // dedicated source contains founder-approved canonical pages.
-                path: if source == "default" {
-                    format!("wiki/frankbrain/{slug}.md")
-                } else {
-                    format!("wiki/{slug}.md")
+                path: match source {
+                    "default" => format!("wiki/frankbrain/{slug}.md"),
+                    "frankbrain" => format!("wiki/{slug}.md"),
+                    // Evidence-source pages are not LLM Wiki pages. Preserve
+                    // their real provenance when gbrain returns it, and use a
+                    // stable source URI otherwise rather than a false wiki
+                    // path that the UI cannot open truthfully.
+                    _ => evidence_path
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("gbrain://{source}/{slug}")),
                 },
                 source: source.to_string(),
                 version_or_hash: page
