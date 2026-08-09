@@ -1415,8 +1415,11 @@ fn parse_founder_retrieval_payload(
                 .get("snippet")
                 .or_else(|| page.get("compiled_truth"))
                 .or_else(|| page.get("content"))
-                .or_else(|| page.get("evidence"))
                 .or_else(|| page.get("chunk_text"))
+                // `evidence` is gbrain's match classification (for example
+                // `high_vector_match`), not evidence text. Prefer the
+                // extracted chunk whenever it is available.
+                .or_else(|| page.get("evidence"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let evidence_path = page
@@ -3176,6 +3179,7 @@ mod tests {
                 "slug": "concepts/provider-abstraction",
                 "source_id": "frankbrain",
                 "title": "Provider Abstraction",
+                "evidence": "high_vector_match",
                 "chunk_text": "One provider-neutral interface routes supported models.",
                 "score": 0.91
             }
