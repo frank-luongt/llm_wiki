@@ -779,7 +779,7 @@ impl AgentRuntime {
             // local evidence sources. Stop at the first source that can
             // ground an answer; do not blend unrelated evidence sources.
             let mut gbrain_grounded = false;
-            for source_id in tools::FOUNDER_GBRAIN_SOURCES {
+            for source_id in founder_gbrain_source_precedence() {
                 tool_emit_event(
                     &mut tool_events,
                     &mut events,
@@ -2635,6 +2635,10 @@ impl AgentRuntime {
     }
 }
 
+fn founder_gbrain_source_precedence() -> &'static [&'static str] {
+    &tools::FOUNDER_GBRAIN_SOURCES
+}
+
 fn agent_structured_max_tokens(has_skills: bool) -> u32 {
     if has_skills {
         AGENT_SKILL_STRUCTURED_MAX_TOKENS
@@ -4195,6 +4199,19 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn founder_gbrain_precedence_is_canonical_then_projected_then_evidence() {
+        assert_eq!(
+            founder_gbrain_source_precedence(),
+            [
+                "frankbrain",
+                "default",
+                "gdrive-workspaces",
+                "faos-projects"
+            ],
+        );
+    }
     use crate::agent::types::{AgentMode, AgentToolOptions};
 
     fn temp_project(name: &str) -> PathBuf {
