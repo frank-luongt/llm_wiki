@@ -204,12 +204,24 @@ fn read_cache(original: &Path) -> Option<String> {
 
 /// Return a fresh preprocessing cache for Agent source retrieval.
 ///
-/// Binary imports remain the referenced source of record; this helper only
-/// exposes their text extraction and never causes parsing or cache writes from
-/// a search request. Keeping freshness checks here also prevents the Agent
-/// from quoting a cache after the original file changed externally.
+/// Binary imports remain the referenced source of record. Current-format
+/// caches are read directly; legacy Office caches are rebuilt once from that
+/// original source so parser upgrades cannot silently erase retrieval.
 pub(crate) fn read_preprocessed_cache(original: &Path) -> Option<String> {
-    read_cache(original)
+    if let Some(cached) = read_cache(original) {
+        return Some(cached);
+    }
+    // Legacy Office imports predate the parser-format sidecar.  Treating that
+    // marker as a hard miss hides every existing Office source forever because
+    // source search does not otherwise re-ingest it. Rebuild lazily from the
+    // original binary, then atomically write the current-format cache.
+    if !uses_anydoc_cache(original) {
+        return None;
+    }
+    let extension = original.extension()?.to_str()?.to_ascii_lowercase();
+    let text = extract_office_text(original.to_str()?, &extension).ok()?;
+    write_cache(original, &text).ok()?;
+    Some(text)
 }
 
 fn write_cache(original: &Path, text: &str) -> Result<(), String> {
