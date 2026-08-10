@@ -139,7 +139,7 @@ function PdfPreview({ filePath, content }: { filePath: string; content: string }
         loadingTask = getDocument({ data: decodeBase64(file.base64) })
         loadedDocument = await loadingTask.promise
         if (disposed) {
-          await loadedDocument.destroy()
+          await loadingTask.destroy()
           return
         }
         setDocument(loadedDocument)
@@ -154,7 +154,7 @@ function PdfPreview({ filePath, content }: { filePath: string; content: string }
     return () => {
       disposed = true
       if (loadingTask) void loadingTask.destroy()
-      else if (loadedDocument) void loadedDocument.destroy()
+      else if (loadedDocument) void loadedDocument.cleanup()
     }
   }, [filePath, reloadKey, t])
 
@@ -351,16 +351,27 @@ function extractedTextLabel(filePath: string): string {
     case "doc":
       return "Word DOC (extracted text)"
     case "docx":
+    case "docm":
       return "Word DOCX (extracted text)"
+    case "ppt":
+    case "pps":
+    case "pot":
     case "pptx":
+    case "pptm":
+    case "ppsx":
+    case "ppsm":
       return "PowerPoint (extracted text)"
     case "xls":
     case "xlsx":
+    case "xlsm":
+    case "xlsb":
       return "Spreadsheet (extracted text)"
     case "odt":
     case "ods":
     case "odp":
       return "OpenDocument (extracted text)"
+    case "rtf":
+      return "Rich Text Format (extracted text)"
     default:
       return "Extracted text"
   }

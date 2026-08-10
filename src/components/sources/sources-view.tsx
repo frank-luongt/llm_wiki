@@ -157,7 +157,8 @@ export function SourcesView() {
           extensions: [
             "md", "mdx", "txt", "org", "rtf", "pdf",
             "html", "htm", "xml",
-            "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+            "doc", "docx", "docm", "xls", "xlsx", "xlsm", "xlsb",
+            "ppt", "pps", "pot", "pptx", "pptm", "ppsx", "ppsm",
             "odt", "ods", "odp", "epub", "mobi", "pages", "numbers", "key",
           ],
         },

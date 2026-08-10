@@ -626,6 +626,8 @@ pub fn run() {
             commands::fs::create_missing_wiki_page,
             commands::file_history::list_file_history,
             commands::file_history::restore_file_history,
+            commands::file_history::get_file_history_stats,
+            commands::file_history::clear_file_history,
             commands::fs::list_directory,
             commands::fs::copy_file,
             commands::fs::copy_directory,

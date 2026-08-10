@@ -107,6 +107,7 @@
     "synthesis": "Synthesis",
     "thinking": "Thinking",
     "open": "Open",
+    "retry": "Retry",
     "remove": "Remove",
     "status": {
       "queued": "Queued",
@@ -851,6 +852,13 @@
           "rebuilt": "Rebuilt index with {{pages}} pages in {{groups}} groups.",
           "exported": "Project exported to {{path}}",
           "imported": "Imported {{name}}. Switch projects to open it."
+        },
+        "history": {
+          "title": "File version history",
+          "description": "Rollback snapshots are stored in .llm-wiki/history. Current files are not stored here. The app automatically retains at most 30 versions per file and bounds total project history size.",
+          "usage": "{{size}} across {{files}} history files ({{entries}} versions)",
+          "clear": "Clear version history",
+          "confirm": "Clear all rollback snapshots for this project? Current project files will not be deleted."
         },
         "dedup": {
           "title": "Detect duplicate entities / concepts",

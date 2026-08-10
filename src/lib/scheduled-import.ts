@@ -16,9 +16,11 @@ import {
   saveScheduledImportConfig,
 } from "@/lib/project-store"
 import {
+  deleteSourceFile,
   enqueueSourceIngest,
   isIngestableSourcePath,
 } from "@/lib/source-lifecycle"
+import { discardTasksForSources } from "@/lib/ingest-queue"
 import { useActivityStore } from "@/stores/activity-store"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 
@@ -282,6 +284,58 @@ function collectFiles(nodes: FileNode[]): FileNode[] {
   return files
 }
 
+function scheduledImportDestinationForSourceKey(
+  projectPath: string,
+  importPath: string,
+  sourceKey: string,
+): string {
+  const name = normalizePath(sourceKey).split("/").pop() ?? "_"
+  return scheduledImportDestinationForFile(projectPath, importPath, {
+    name,
+    path: sourceKey,
+  })
+}
+
+async function cleanupRemovedScheduledImports(
+  project: WikiProject,
+  importRoot: string,
+  db: ImportDb,
+  observedEligibleKeys: ReadonlySet<string>,
+  nextDb: ImportDb,
+): Promise<boolean> {
+  const removedKeys = Object.keys(db.files).filter(
+    (key) => !observedEligibleKeys.has(key) && !(key in nextDb.files),
+  )
+  if (removedKeys.length === 0) return false
+
+  const destinations = removedKeys.map((key) => ({
+    key,
+    path: scheduledImportDestinationForSourceKey(project.path, importRoot, key),
+  }))
+  await discardTasksForSources(destinations.map((entry) => entry.path))
+
+  let changed = false
+  for (const destination of destinations) {
+    try {
+      const exists = await fileExists(destination.path)
+      await deleteSourceFile(project.path, destination.path, {
+        fileAlreadyDeleted: !exists,
+        logReason: "scheduled import source removed or excluded",
+      })
+      changed = true
+    } catch (err) {
+      // Preserve the old record so a later scan retries cleanup rather than
+      // silently forgetting a stale mirror or its generated wiki pages.
+      nextDb.files[destination.key] = db.files[destination.key]
+      console.warn(
+        `[scheduled-import] failed to clean removed source ${destination.path}:`,
+        err,
+      )
+    }
+  }
+  return changed
+}
+
 async function loadDbStore(projectPath: string): Promise<ImportDbStore> {
   const path = dbFilePath(projectPath)
   try {
@@ -379,6 +433,7 @@ export async function scanAndImport(
     const nextDb: ImportDb = { files: {}, lastScan: Date.now() }
     const llmConfig = useWikiStore.getState().llmConfig
     const changedFiles: Array<{ key: string; md5: string; destPath: string }> = []
+    const observedEligibleKeys = new Set<string>()
 
     for (const file of collectFiles(tree)) {
       try {
@@ -390,6 +445,8 @@ export async function scanAndImport(
         ) {
           continue
         }
+
+        const key = dbDirectoryKey(sourcePath)
 
         if (!isCurrentRun(project.id, options.runId)) {
           return
@@ -403,7 +460,8 @@ export async function scanAndImport(
           continue
         }
 
-        const key = dbDirectoryKey(sourcePath)
+        observedEligibleKeys.add(key)
+
         const md5 = await getFileMd5(sourcePath)
 
         if (db.files[key] === md5) {
@@ -417,9 +475,25 @@ export async function scanAndImport(
         }
         changedFiles.push({ key, md5, destPath })
       } catch (err) {
+        const key = dbDirectoryKey(file.path)
+        if (db.files[key]) {
+          nextDb.files[key] = db.files[key]
+        }
         console.warn(`[scheduled-import] skipped ${file.path}:`, err)
       }
     }
+
+    if (!isCurrentRun(project.id, options.runId)) {
+      return
+    }
+
+    const removedSourcesChanged = await cleanupRemovedScheduledImports(
+      project,
+      importRoot,
+      db,
+      observedEligibleKeys,
+      nextDb,
+    )
 
     if (!isCurrentRun(project.id, options.runId)) {
       return
@@ -433,14 +507,18 @@ export async function scanAndImport(
           for (const file of changedFiles) {
             nextDb.files[file.key] = file.md5
           }
-          await refreshProjectFileTree(projectPath, {
-            projectId: project.id,
-            bumpDataVersion: true,
-          })
         } else {
           console.warn("[scheduled-import] LLM is not configured; changed files were not marked imported")
         }
       }
+    }
+
+
+    if (removedSourcesChanged || changedFiles.some((file) => nextDb.files[file.key])) {
+      await refreshProjectFileTree(projectPath, {
+        projectId: project.id,
+        bumpDataVersion: true,
+      })
     }
 
     await saveImportDb(projectPath, importRoot, nextDb)

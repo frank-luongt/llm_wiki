@@ -58,6 +58,7 @@ import {
   retryAllFailedTasks,
   cancelTask,
   cancelTasks,
+  discardTasksForSources,
   cancelAllTasks,
   movePendingTask,
   clearCompletedTasks,
@@ -271,6 +272,21 @@ describe("ingest-queue — retry & failure", () => {
 })
 
 describe("ingest-queue — cancel", () => {
+  it("permanently discards queued work for a removed source", async () => {
+    mockAutoIngest.mockImplementation(() => new Promise(() => {}))
+    await enqueueBatch(TEST_ID, [
+      { sourcePath: "raw/sources/active.md", folderContext: "" },
+      { sourcePath: "raw/sources/removed.md", folderContext: "" },
+    ])
+    await flushMicrotasks(2)
+
+    expect(
+      await discardTasksForSources([`${TEST_PATH}/raw/sources/removed.md`]),
+    ).toBe(1)
+    expect(getQueue().some((task) => task.sourcePath.endsWith("removed.md"))).toBe(false)
+    expect(getQueue().some((task) => task.sourcePath.endsWith("active.md"))).toBe(true)
+  })
+
   it("cancelTask retains a pending task for restart without calling autoIngest", async () => {
     mockAutoIngest.mockImplementation(() => new Promise(() => {})) // block first task
 

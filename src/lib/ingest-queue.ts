@@ -433,6 +433,55 @@ export async function cancelTasks(taskIds: readonly string[]): Promise<number> {
 }
 
 /**
+ * Permanently discard active-project tasks for sources that no longer exist.
+ * Unlike cancelTasks, this does not retain restartable queue entries because
+ * scheduled-import reconciliation has already established that the mirrored
+ * source must be removed.
+ */
+export async function discardTasksForSources(
+  sourcePaths: readonly string[],
+): Promise<number> {
+  const targets = queue.filter(
+    (task) =>
+      task.projectId === currentProjectId &&
+      sourcePaths.some((sourcePath) => {
+        const source = normalizeSourcePathForQueue(sourcePath)
+        const queued = normalizeSourcePathForQueue(task.sourcePath)
+        return (
+          source === queued ||
+          (isAbsolutePath(source) && !isAbsolutePath(queued) && source.endsWith(`/${queued}`)) ||
+          (isAbsolutePath(queued) && !isAbsolutePath(source) && queued.endsWith(`/${source}`))
+        )
+      }),
+  )
+  if (targets.length === 0) return 0
+
+  const targetIds = new Set(targets.map((task) => task.id))
+  const hadProcessingTask = targets.some((task) => task.status === "processing")
+  for (const task of targets) {
+    restoredPausedTaskIds.delete(task.id)
+    if (task.status === "processing") cancelledInFlightTaskIds.add(task.id)
+  }
+  if (hadProcessingTask && currentAbortController) {
+    currentAbortController.abort()
+    currentAbortController = null
+  }
+  if (hadProcessingTask && lastWrittenFiles.length > 0) {
+    await cleanupWrittenFiles(currentProjectPath, lastWrittenFiles)
+    lastWrittenFiles = []
+  }
+
+  queue = queue.filter((task) => !targetIds.has(task.id))
+  if (!queue.some((task) => task.status === "pending" || task.status === "processing")) {
+    paused = false
+    clearUsageLimitAutoResume()
+  }
+  await saveQueue(currentProjectPath)
+  if (!hadProcessingTask) processNext(currentProjectId)
+  return targets.length
+}
+
+/**
  * Clear all done/failed tasks from the active project's queue.
  */
 export async function clearCompletedTasks(): Promise<void> {

@@ -107,6 +107,7 @@
     "synthesis": "综合结果",
     "thinking": "思考中",
     "open": "打开",
+    "retry": "重试",
     "remove": "移除",
     "status": {
       "queued": "排队中",
@@ -851,6 +852,13 @@
           "rebuilt": "已使用 {{pages}} 个页面、{{groups}} 个分组重建索引。",
           "exported": "项目已导出到 {{path}}",
           "imported": "已导入 {{name}}，请切换项目后打开。"
+        },
+        "history": {
+          "title": "文件版本历史",
+          "description": "回滚快照保存在 .llm-wiki/history，当前文件不存放在这里。应用会为每个文件最多保留 30 个版本，并限制项目历史的总容量。",
+          "usage": "{{files}} 个历史文件、{{entries}} 个版本，共占用 {{size}}",
+          "clear": "清空版本历史",
+          "confirm": "确定清空此项目的全部回滚快照吗？当前项目文件不会被删除。"
         },
         "dedup": {
           "title": "检测重复实体 / 概念",

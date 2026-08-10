@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   readFile: vi.fn(),
   writeFileAtomic: vi.fn(),
   enqueueSourceIngest: vi.fn(),
+  deleteSourceFile: vi.fn(),
+  discardTasksForSources: vi.fn(),
   isIngestableSourcePath: vi.fn(),
   loadScheduledImportConfig: vi.fn(),
   saveScheduledImportConfig: vi.fn(),
@@ -28,8 +30,13 @@ vi.mock("@/commands/fs", () => ({
 }))
 
 vi.mock("@/lib/source-lifecycle", () => ({
+  deleteSourceFile: mocks.deleteSourceFile,
   enqueueSourceIngest: mocks.enqueueSourceIngest,
   isIngestableSourcePath: mocks.isIngestableSourcePath,
+}))
+
+vi.mock("@/lib/ingest-queue", () => ({
+  discardTasksForSources: mocks.discardTasksForSources,
 }))
 
 vi.mock("@/lib/project-store", () => ({
@@ -216,6 +223,11 @@ describe("scanAndImport failure handling", () => {
     mocks.getFileSize.mockResolvedValue(1024)
     mocks.getFileMd5.mockResolvedValue("md5-new")
     mocks.copyFile.mockResolvedValue(undefined)
+    mocks.deleteSourceFile.mockResolvedValue({
+      deletedWikiPaths: [],
+      rewrittenSourcePages: 0,
+    })
+    mocks.discardTasksForSources.mockResolvedValue(0)
     mocks.preprocessFile.mockResolvedValue("")
     mocks.isIngestableSourcePath.mockReturnValue(true)
     mocks.loadScheduledImportConfig.mockResolvedValue({
@@ -343,6 +355,81 @@ describe("scanAndImport failure handling", () => {
     expect(mocks.enqueueSourceIngest).toHaveBeenCalledWith(
       project,
       ["/Users/me/wiki-project/raw/sources/scheduled-import/notes.md"],
+      expect.any(Object),
+    )
+  })
+
+  it("removes mirrors and derived knowledge for deleted scheduled sources", async () => {
+    mocks.fileExists.mockImplementation(async (path: string) =>
+      path.endsWith("scheduled-import-db.json") || path.endsWith("scheduled-import/old.pdf")
+    )
+    mocks.readFile.mockResolvedValue(JSON.stringify({
+      version: 1,
+      directories: {
+        "/Users/me/inbox": {
+          files: { "/Users/me/inbox/old.pdf": "old-md5" },
+          lastScan: 123,
+        },
+      },
+    }))
+    mocks.listDirectory.mockResolvedValue([])
+
+    await scanAndImport(project, "/Users/me/inbox")
+
+    const mirror = "/Users/me/wiki-project/raw/sources/scheduled-import/old.pdf"
+    expect(mocks.discardTasksForSources).toHaveBeenCalledWith([mirror])
+    expect(mocks.deleteSourceFile).toHaveBeenCalledWith(project.path, mirror, {
+      fileAlreadyDeleted: false,
+      logReason: "scheduled import source removed or excluded",
+    })
+    expect(mocks.writeFileAtomic).toHaveBeenCalledWith(
+      "/Users/me/wiki-project/.llm-wiki/scheduled-import-db.json",
+      expect.not.stringContaining("old.pdf"),
+    )
+  })
+
+  it("keeps an existing source record when the file is temporarily unreadable", async () => {
+    mocks.fileExists.mockResolvedValue(true)
+    mocks.readFile.mockResolvedValue(JSON.stringify({
+      version: 1,
+      directories: {
+        "/Users/me/inbox": {
+          files: { "/Users/me/inbox/paper.pdf": "old-md5" },
+          lastScan: 123,
+        },
+      },
+    }))
+    mocks.getFileMd5.mockRejectedValue(new Error("sharing violation"))
+
+    await scanAndImport(project, "/Users/me/inbox")
+
+    expect(mocks.deleteSourceFile).not.toHaveBeenCalled()
+    expect(mocks.writeFileAtomic).toHaveBeenCalledWith(
+      "/Users/me/wiki-project/.llm-wiki/scheduled-import-db.json",
+      expect.stringContaining('"/Users/me/inbox/paper.pdf": "old-md5"'),
+    )
+  })
+
+  it("cleans a previously imported file that is now excluded", async () => {
+    mocks.fileExists.mockResolvedValue(true)
+    mocks.readFile.mockResolvedValue(JSON.stringify({
+      version: 1,
+      directories: {
+        "/Users/me/inbox": {
+          files: { "/Users/me/inbox/settings.json": "old-md5" },
+          lastScan: 123,
+        },
+      },
+    }))
+    mocks.listDirectory.mockResolvedValue([
+      { name: "settings.json", path: "/Users/me/inbox/settings.json", is_dir: false },
+    ])
+
+    await scanAndImport(project, "/Users/me/inbox")
+
+    expect(mocks.deleteSourceFile).toHaveBeenCalledWith(
+      project.path,
+      "/Users/me/wiki-project/raw/sources/scheduled-import/settings.json",
       expect.any(Object),
     )
   })

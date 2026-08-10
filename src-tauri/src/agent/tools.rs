@@ -47,6 +47,16 @@ const SHELL_OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 1;
 const DEFAULT_ANYTXT_ENDPOINT: &str = "http://127.0.0.1:9920";
 const DEFAULT_ANYTXT_LIMIT: usize = 20;
 const ANYTXT_LAST_MODIFY_END: i64 = 2_147_483_647;
+const GBRAIN_BASE_URL: &str = "http://127.0.0.1:3131";
+const GBRAIN_KEYCHAIN_ACCOUNT: &str = "llm-wiki-founder-read";
+const GBRAIN_CLIENT_ID_SERVICE: &str = "com.faosx.gbrain.oauth.client-id";
+const GBRAIN_CLIENT_SECRET_SERVICE: &str = "com.faosx.gbrain.oauth.client-secret";
+pub const FOUNDER_GBRAIN_SOURCES: [&str; 4] = [
+    "frankbrain",
+    "gdrive-workspaces",
+    "faos-projects",
+    "default",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -237,6 +247,18 @@ impl ToolRegistry for BuiltinToolRegistry {
                     serde_json::to_value(references)
                         .map_err(|err| format!("Failed to serialize graph.search result: {err}"))
                 }
+                "gbrain.query" => {
+                    let query = tool_query(&input, "gbrain.query")?;
+                    let source_id = input
+                        .get("sourceId")
+                        .or_else(|| input.get("source_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("frankbrain");
+                    serde_json::to_value(
+                        run_gbrain_query(query, source_id, tool_top_k(&input)).await?,
+                    )
+                    .map_err(|err| format!("Failed to serialize gbrain.query result: {err}"))
+                }
                 "web.search" => {
                     let query = tool_query(&input, "web.search")?;
                     serde_json::to_value(
@@ -291,6 +313,28 @@ pub struct WikiSearchToolOutput {
     pub vector_hits: usize,
     pub graph_hits: usize,
     pub references: Vec<AgentReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct FounderRetrievalReference {
+    pub title: String,
+    pub path: String,
+    pub source: String,
+    pub version_or_hash: String,
+    pub evidence_snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct FounderRetrievalOutput {
+    pub status: String,
+    pub answer: String,
+    pub grounding_source: String,
+    pub references: Vec<FounderRetrievalReference>,
+    pub confidence: f64,
+    pub freshness: Option<String>,
+    pub sensitivity: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -488,6 +532,25 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
             })),
         },
         ToolSpec {
+            name: "gbrain.query".to_string(),
+            description: "Read-only, source-scoped hybrid retrieval from the local founder gbrain. Use after published and projected wiki pages are insufficient."
+                .to_string(),
+            effects: vec![ToolEffect::Network, ToolEffect::Read],
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "sourceId": {
+                        "type": "string",
+                        "enum": ["frankbrain", "default", "gdrive-workspaces", "faos-projects"],
+                        "default": "frankbrain"
+                    },
+                    "topK": { "type": "integer", "minimum": 1, "maximum": 10 }
+                },
+                "required": ["query"]
+            })),
+        },
+        ToolSpec {
             name: "anytxt.search".to_string(),
             description: "Search files indexed by an AnyTXT JSON-RPC service.".to_string(),
             effects: vec![ToolEffect::Network, ToolEffect::Read],
@@ -666,6 +729,12 @@ fn write_wiki_page_with_activity(
         return Err("wiki.write_page content is too large".to_string());
     }
     let rel = normalize_wiki_write_path(rel_path)?;
+    if rel == "wiki/frankbrain" || rel.starts_with("wiki/frankbrain/") {
+        return Err(
+            "wiki.write_page refuses generated FrankBrain projection paths; write proposals under wiki/inbox/fbrain/"
+                .to_string(),
+        );
+    }
     let path = safe_project_join(project_path, &rel)?;
     if let Some(parent) = path.parent() {
         // Check the deepest existing ancestor before creating directories. If a
@@ -1159,6 +1228,283 @@ where
         text = trim_text(&text, max_chars);
     }
     text
+}
+
+async fn keychain_secret(service: &str) -> Result<String, String> {
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-a",
+            GBRAIN_KEYCHAIN_ACCOUNT,
+            "-s",
+            service,
+            "-w",
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("Failed to read gbrain credential from Keychain: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Missing Keychain credential for account {GBRAIN_KEYCHAIN_ACCOUNT} and service {service}"
+        ));
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|_| "Keychain returned a non-UTF8 credential".to_string())?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        return Err("Keychain returned an empty gbrain credential".to_string());
+    }
+    Ok(value)
+}
+
+fn parse_mcp_sse_envelope(body: &str) -> Result<Value, String> {
+    for line in body.lines().rev() {
+        let candidate = line.strip_prefix("data: ").unwrap_or(line).trim();
+        if candidate.starts_with('{') {
+            if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+                return Ok(value);
+            }
+        }
+    }
+    Err("gbrain returned no JSON-RPC envelope".to_string())
+}
+
+fn unavailable_gbrain_result() -> FounderRetrievalOutput {
+    FounderRetrievalOutput {
+        status: "unavailable".to_string(),
+        answer: "unavailable".to_string(),
+        grounding_source: "none".to_string(),
+        references: Vec::new(),
+        confidence: 0.0,
+        freshness: None,
+        sensitivity: "local_only".to_string(),
+    }
+}
+
+pub async fn run_gbrain_query(
+    query: &str,
+    source_id: &str,
+    top_k: usize,
+) -> Result<FounderRetrievalOutput, String> {
+    if !FOUNDER_GBRAIN_SOURCES.contains(&source_id) {
+        return Err(
+            "gbrain.query sourceId must be frankbrain, default, gdrive-workspaces, or faos-projects"
+                .to_string(),
+        );
+    }
+    let client_id = keychain_secret(GBRAIN_CLIENT_ID_SERVICE).await?;
+    let client_secret = keychain_secret(GBRAIN_CLIENT_SECRET_SERVICE).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| format!("Failed to build gbrain client: {err}"))?;
+    let token_response = client
+        .post(format!("{GBRAIN_BASE_URL}/token"))
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
+            ("scope", "read"),
+        ])
+        .send()
+        .await
+        .map_err(|err| format!("gbrain token request failed: {err}"))?;
+    if !token_response.status().is_success() {
+        return Err(format!(
+            "gbrain token request failed with HTTP {}",
+            token_response.status()
+        ));
+    }
+    let token_payload: Value = token_response
+        .json()
+        .await
+        .map_err(|err| format!("Invalid gbrain token response: {err}"))?;
+    let access_token = token_payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "gbrain token response omitted access_token".to_string())?;
+
+    let response = client
+        .post(format!("{GBRAIN_BASE_URL}/mcp"))
+        .bearer_auth(access_token)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": {
+                    "query": query,
+                    "source_id": source_id,
+                    "limit": top_k.clamp(1, 10),
+                    "expand": false,
+                    // `low` returns compiled truth only and can omit the
+                    // evidence snippet for generated extraction pages. The
+                    // UI must receive source text to synthesize a grounded
+                    // answer and render a meaningful citation.
+                    "detail": "medium",
+                    "adaptive_return": true
+                }
+            }
+        }))
+        .send()
+        .await
+        .map_err(|err| format!("gbrain.query request failed: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "gbrain.query failed with HTTP {}",
+            response.status()
+        ));
+    }
+    let envelope = parse_mcp_sse_envelope(
+        &response
+            .text()
+            .await
+            .map_err(|err| format!("Failed to read gbrain.query response: {err}"))?,
+    )?;
+    let tool_text = envelope
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "gbrain.query returned no content".to_string())?;
+    let payload: Value = serde_json::from_str(tool_text)
+        .map_err(|err| format!("gbrain.query returned invalid JSON content: {err}"))?;
+    parse_founder_retrieval_payload(&payload, source_id, top_k)
+}
+
+/// Normalize the documented object envelopes and gbrain's current compact
+/// query response (a top-level result array) into one founder retrieval
+/// contract. Keeping this parsing independent from HTTP makes a response
+/// shape change testable before it becomes an `unavailable` answer in the UI.
+fn parse_founder_retrieval_payload(
+    payload: &Value,
+    source_id: &str,
+    top_k: usize,
+) -> Result<FounderRetrievalOutput, String> {
+    if payload.get("error").is_some() {
+        return Err(format!(
+            "gbrain.query failed: {}",
+            payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        ));
+    }
+
+    let pages = payload.as_array().or_else(|| {
+        payload
+            .get("pages")
+            .or_else(|| payload.get("results"))
+            .and_then(Value::as_array)
+    });
+    let mut references = Vec::new();
+    if let Some(pages) = pages {
+        for page in pages.iter().take(top_k.clamp(1, 10)) {
+            let slug = page
+                .get("slug")
+                .or_else(|| page.get("path"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let source = page
+                .get("source_id")
+                .or_else(|| page.get("source"))
+                .and_then(Value::as_str)
+                .unwrap_or(source_id);
+            let snippet = page
+                .get("snippet")
+                .or_else(|| page.get("compiled_truth"))
+                .or_else(|| page.get("content"))
+                .or_else(|| page.get("chunk_text"))
+                // `evidence` is gbrain's match classification (for example
+                // `high_vector_match`), not evidence text. Prefer the
+                // extracted chunk whenever it is available.
+                .or_else(|| page.get("evidence"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let evidence_path = page
+                .get("source_path")
+                .or_else(|| page.get("source_uri"))
+                .or_else(|| page.pointer("/frontmatter/source_path"))
+                .and_then(Value::as_str);
+            references.push(FounderRetrievalReference {
+                title: page
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or(slug)
+                    .to_string(),
+                // Resolve citations to the local readable layer whenever one
+                // exists. `default` is the generated projection while the
+                // dedicated source contains founder-approved canonical pages.
+                path: match source {
+                    "default" => format!("wiki/frankbrain/{slug}.md"),
+                    "frankbrain" => format!("wiki/{slug}.md"),
+                    // Evidence-source pages are not LLM Wiki pages. Preserve
+                    // their real provenance when gbrain returns it, and use a
+                    // stable source URI otherwise rather than a false wiki
+                    // path that the UI cannot open truthfully.
+                    _ => evidence_path
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("gbrain://{source}/{slug}")),
+                },
+                source: source.to_string(),
+                version_or_hash: page
+                    .get("content_hash")
+                    .or_else(|| page.get("version"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                evidence_snippet: trim_text(snippet, 500),
+            });
+        }
+    }
+    let mut answer = payload
+        .get("answer")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // Compact gbrain query responses are result arrays, not answer envelopes.
+    // Preserve their evidence in the retrieval context so the final local
+    // synthesis can answer from the same cited snippets instead of seeing
+    // only opaque `gbrain://` reference paths.
+    if answer.is_empty() && !references.is_empty() {
+        answer = references
+            .iter()
+            .filter(|reference| !reference.evidence_snippet.trim().is_empty())
+            .map(|reference| {
+                format!(
+                    "{} [{}]: {}",
+                    reference.title, reference.source, reference.evidence_snippet
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
+    if references.is_empty() && answer.is_empty() {
+        return Ok(unavailable_gbrain_result());
+    }
+    let confidence = payload
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .or_else(|| payload.pointer("/pages/0/score").and_then(Value::as_f64))
+        .or_else(|| payload.pointer("/results/0/score").and_then(Value::as_f64))
+        .or_else(|| payload.pointer("/0/score").and_then(Value::as_f64))
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
+    Ok(FounderRetrievalOutput {
+        status: "ok".to_string(),
+        answer,
+        grounding_source: "gbrain".to_string(),
+        references,
+        confidence,
+        freshness: payload
+            .get("freshness")
+            .or_else(|| payload.get("updated_at"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        sensitivity: "local_only".to_string(),
+    })
 }
 
 pub async fn run_web_search(
@@ -2452,12 +2798,22 @@ pub fn search_sources(
             "pdf"
                 | "doc"
                 | "docx"
+                | "docm"
+                | "ppt"
+                | "pps"
+                | "pot"
                 | "pptx"
+                | "pptm"
+                | "ppsx"
+                | "ppsm"
                 | "xls"
                 | "xlsx"
+                | "xlsm"
+                | "xlsb"
                 | "odt"
                 | "ods"
                 | "odp"
+                | "rtf"
                 | "epub"
                 | "mobi"
         ) {
@@ -2805,6 +3161,47 @@ mod tests {
         assert!(names.contains(&"workspace.write_file".to_string()));
         assert!(names.contains(&"workspace.append_file".to_string()));
         assert!(names.contains(&"shell.exec".to_string()));
+    }
+
+    #[test]
+    fn founder_gbrain_source_allowlist_is_scoped_to_approved_local_sources() {
+        assert!(FOUNDER_GBRAIN_SOURCES.contains(&"frankbrain"));
+        assert!(FOUNDER_GBRAIN_SOURCES.contains(&"default"));
+        assert!(FOUNDER_GBRAIN_SOURCES.contains(&"gdrive-workspaces"));
+        assert!(FOUNDER_GBRAIN_SOURCES.contains(&"faos-projects"));
+        assert!(!FOUNDER_GBRAIN_SOURCES.contains(&"untrusted-source"));
+    }
+
+    #[test]
+    fn founder_gbrain_query_accepts_current_compact_array_response() {
+        let payload = serde_json::json!([
+            {
+                "slug": "concepts/provider-abstraction",
+                "source_id": "frankbrain",
+                "title": "Provider Abstraction",
+                "evidence": "high_vector_match",
+                "chunk_text": "One provider-neutral interface routes supported models.",
+                "score": 0.91
+            }
+        ]);
+
+        let result = parse_founder_retrieval_payload(&payload, "frankbrain", 3).unwrap();
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(
+            result.references[0].path,
+            "wiki/concepts/provider-abstraction.md"
+        );
+        assert_eq!(
+            result.references[0].evidence_snippet,
+            "One provider-neutral interface routes supported models."
+        );
+        assert!(result.answer.contains("Provider Abstraction [frankbrain]"));
+        assert!(result
+            .answer
+            .contains("One provider-neutral interface routes supported models."));
+        assert_eq!(result.confidence, 0.91);
     }
 
     #[test]
@@ -3240,6 +3637,14 @@ mod tests {
             false,
         )
         .is_err());
+        let projection_error = write_wiki_page_with_options(
+            root.to_str().unwrap(),
+            "wiki/frankbrain/generated-page.md",
+            "# Generated evidence",
+            false,
+        )
+        .unwrap_err();
+        assert!(projection_error.contains("generated FrankBrain projection"));
 
         let reference = write_wiki_page_with_options(
             root.to_str().unwrap(),

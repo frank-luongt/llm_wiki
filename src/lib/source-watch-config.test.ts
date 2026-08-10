@@ -7,6 +7,11 @@ import {
 import sourceWatchDefaults from "@/lib/source-watch-defaults.json"
 
 describe("source watch config", () => {
+  it("includes AnyDoc Office and RTF variants in the default watch set", () => {
+    for (const extension of ["docm", "ppt", "ppsm", "xlsb", "rtf"]) {
+      expect(DEFAULT_SOURCE_WATCH_CONFIG.includeExtensions).toContain(extension)
+    }
+  })
   it("uses the shared default fixture", () => {
     expect(DEFAULT_SOURCE_WATCH_CONFIG).toEqual(sourceWatchDefaults)
     expect(normalizeSourceWatchConfig({}).persistExtractedMarkdown).toBe(false)

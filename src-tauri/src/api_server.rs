@@ -892,17 +892,7 @@ fn is_text_content_rel(rel: &str) -> bool {
         .unwrap_or("");
     matches!(
         ext,
-        "md" | "mdx"
-            | "txt"
-            | "csv"
-            | "json"
-            | "yaml"
-            | "yml"
-            | "xml"
-            | "html"
-            | "htm"
-            | "rtf"
-            | "log"
+        "md" | "mdx" | "txt" | "csv" | "json" | "yaml" | "yml" | "xml" | "html" | "htm" | "log"
     )
 }
 
@@ -2681,6 +2671,7 @@ mod tests {
         assert!(is_text_content_rel("wiki/index.md"));
         assert!(!is_text_content_rel("wiki/media/image.png"));
         assert!(!is_text_content_rel("raw/sources/book.pdf"));
+        assert!(!is_text_content_rel("raw/sources/notes.rtf"));
     }
 
     #[test]

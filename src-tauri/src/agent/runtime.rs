@@ -312,6 +312,7 @@ impl AgentRuntime {
         );
         let should_search_wiki =
             router.should_search_wiki || planned_has("wiki.search") || fallback_wiki_search;
+        let should_query_gbrain = request.tools.wiki && planned_has("gbrain.query");
         let should_include_sources = router.should_include_sources || planned_has("source.search");
         let should_search_graph = matches!(router.intent, super::router::QueryIntent::NeedsGraph)
             || planned_has("graph.search");
@@ -762,6 +763,154 @@ impl AgentRuntime {
             ));
         }
 
+        // Founder retrieval precedence is local readable pages first, then
+        // source-scoped gbrain evidence. Never broaden to gbrain while wiki
+        // already supplied a usable citation unless the planner explicitly
+        // requested the governed fallback.
+        // A governed gbrain fallback is meaningful only when the planner
+        // explicitly asked for it or an actual wiki search completed with no
+        // usable citations.  Do not turn greetings or router-skipped turns
+        // into source-scoped founder retrieval.
+        if request.tools.wiki && (should_query_gbrain || (should_search_wiki && references.is_empty())) {
+            check_cancel(cancellation.as_ref())?;
+            permission_policy.require(AgentCapability::ReadSource)?;
+            let gbrain_query = planned_queries
+                .get("gbrain.query")
+                .map(String::as_str)
+                .unwrap_or(message);
+            // Keep the founder-brain contract deterministic: human-approved
+            // canonical content first, then its readable projection, then
+            // local evidence sources. Stop at the first source that can
+            // ground an answer; do not blend unrelated evidence sources.
+            let mut gbrain_grounded = false;
+            for source_id in founder_gbrain_source_precedence() {
+                tool_emit_event(
+                    &mut tool_events,
+                    &mut events,
+                    &event_sink,
+                    AgentToolEvent {
+                        tool: "gbrain.query".to_string(),
+                        status: "started".to_string(),
+                        detail: Some(format!("{source_id}: {gbrain_query}")),
+                    },
+                );
+                emit_event(
+                    &mut events,
+                    &event_sink,
+                    AgentEvent::tool_start(
+                        "gbrain.query",
+                        Some(format!("{source_id}: {gbrain_query}")),
+                    ),
+                );
+                let result = execute_tool_with_cancellation(
+                    tool_registry.execute(
+                        "gbrain.query",
+                        serde_json::json!({
+                            "query": gbrain_query,
+                            "sourceId": source_id,
+                            "topK": request.top_k.unwrap_or(DEFAULT_CHAT_SEARCH_RESULTS)
+                        }),
+                        self.tool_context(),
+                    ),
+                    cancellation.as_ref(),
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<tools::FounderRetrievalOutput>(value)
+                        .map_err(|err| format!("Invalid gbrain.query result: {err}"))
+                });
+                match result {
+                    Ok(founder) => {
+                        let count = founder.references.len();
+                        // A vector search returns a nearest neighbour even
+                        // for an unrelated question. Canonical precedence is
+                        // therefore "first sufficient evidence", not simply
+                        // "first non-empty result": keep searching the
+                        // governed evidence sources unless a returned title
+                        // actually overlaps a substantive query term.
+                        let usable = founder.status != "unavailable"
+                            && founder_references_match_query(&founder.references, gbrain_query);
+                        // Preserve the activity record for every governed
+                        // source queried, but only pass relevant evidence to
+                        // synthesis and citations. A vector neighbour is not
+                        // evidence for this question just because it has a
+                        // generated non-empty summary.
+                        if usable {
+                            for item in founder.references {
+                                let reference = AgentReference {
+                                    title: item.title,
+                                    path: item.path,
+                                    kind: "gbrain".to_string(),
+                                    snippet: Some(format!(
+                                        "[{} @ {}] {}",
+                                        item.source, item.version_or_hash, item.evidence_snippet
+                                    )),
+                                    score: Some(founder.confidence),
+                                    knowledge_context: None,
+                                };
+                                push_unique_reference(
+                                    &mut references,
+                                    &mut events,
+                                    &event_sink,
+                                    reference,
+                                );
+                            }
+                            if !founder.answer.trim().is_empty() {
+                                retrieval_parts.push(founder.answer);
+                            }
+                        }
+                        tool_emit_event(
+                            &mut tool_events,
+                            &mut events,
+                            &event_sink,
+                            AgentToolEvent {
+                                tool: "gbrain.query".to_string(),
+                                status: "completed".to_string(),
+                                detail: Some(format!(
+                                    "{source_id}: {count} source-scoped result(s)"
+                                )),
+                            },
+                        );
+                        emit_event(
+                            &mut events,
+                            &event_sink,
+                            AgentEvent::tool_end(
+                                "gbrain.query",
+                                Some(format!("{source_id}: {count} result(s)")),
+                            ),
+                        );
+                        if usable {
+                            gbrain_grounded = true;
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        tool_emit_event(
+                            &mut tool_events,
+                            &mut events,
+                            &event_sink,
+                            AgentToolEvent {
+                                tool: "gbrain.query".to_string(),
+                                status: "failed".to_string(),
+                                detail: Some(format!("{source_id}: {err}")),
+                            },
+                        );
+                        emit_event(
+                            &mut events,
+                            &event_sink,
+                            AgentEvent::tool_end(
+                                "gbrain.query",
+                                Some(format!("{source_id}: failed: {err}")),
+                            ),
+                        );
+                    }
+                }
+            }
+            if !gbrain_grounded {
+                retrieval_parts.push("unavailable".to_string());
+            }
+        }
+
         if should_include_sources {
             check_cancel(cancellation.as_ref())?;
             permission_policy.require(AgentCapability::ReadSource)?;
@@ -1173,7 +1322,31 @@ impl AgentRuntime {
             self.llm_config.as_ref(),
         );
 
-        let answer = if let Some(config) = self
+        let has_local_only_founder_evidence = references
+            .iter()
+            .any(|reference| reference.kind.eq_ignore_ascii_case("gbrain"));
+        let answer = if has_local_only_founder_evidence
+            && self
+                .llm_config
+                .as_ref()
+                .is_some_and(|config| !is_local_founder_synthesis_config(config))
+        {
+            // The backend Agent path can call HTTP providers directly, bypassing
+            // the frontend preset selector.  Do not serialize gbrain evidence
+            // into a frontier request: return the grounded local retrieval until
+            // an explicit local Ollama configuration is available.
+            tool_emit_event(
+                &mut tool_events,
+                &mut events,
+                &event_sink,
+                AgentToolEvent {
+                    tool: "llm.generate".to_string(),
+                    status: "skipped".to_string(),
+                    detail: Some("local_only founder evidence requires local Ollama synthesis".to_string()),
+                },
+            );
+            retrieval_summary
+        } else if let Some(config) = self
             .llm_config
             .as_ref()
             .filter(|cfg| cfg.is_usable_for_backend_http())
@@ -2148,7 +2321,8 @@ impl AgentRuntime {
             .unwrap_or(DEFAULT_CHAT_SEARCH_RESULTS)
             .clamp(1, MAX_CHAT_SEARCH_RESULTS);
         match tool {
-            "wiki.search" | "source.search" | "graph.search" | "web.search" | "anytxt.search" => {
+            "wiki.search" | "gbrain.query" | "source.search" | "graph.search" | "web.search"
+            | "anytxt.search" => {
                 let query = action
                     .query
                     .as_deref()
@@ -2271,6 +2445,36 @@ impl AgentRuntime {
                     })
                     .count();
                 Ok(format!("{count} result(s), {added} new"))
+            }
+            "gbrain.query" => {
+                let founder: tools::FounderRetrievalOutput = serde_json::from_value(value)
+                    .map_err(|err| format!("Invalid gbrain.query result: {err}"))?;
+                let count = founder.references.len();
+                let mut added = 0usize;
+                for item in founder.references {
+                    let reference = AgentReference {
+                        title: item.title,
+                        path: item.path,
+                        kind: "gbrain".to_string(),
+                        snippet: Some(format!(
+                            "[{} @ {}] {}",
+                            item.source, item.version_or_hash, item.evidence_snippet
+                        )),
+                        score: Some(founder.confidence),
+                        knowledge_context: None,
+                    };
+                    if push_unique_reference(references, events, event_sink, reference) {
+                        added += 1;
+                    }
+                }
+                if founder.status == "unavailable" {
+                    Ok("unavailable: no sufficient founder evidence".to_string())
+                } else {
+                    Ok(format!(
+                        "{count} result(s), {added} new, sensitivity={}, confidence={:.2}",
+                        founder.sensitivity, founder.confidence
+                    ))
+                }
             }
             "wiki.read_page" => {
                 let path = value
@@ -2442,6 +2646,7 @@ impl AgentRuntime {
         check_cancel(cancellation)?;
         let mut available = vec![
             "wiki.search",
+            "gbrain.query",
             "source.search",
             "graph.search",
             "wiki.write_page",
@@ -2461,7 +2666,7 @@ impl AgentRuntime {
         let skill_context = render_skill_planner_context(skills, skill_mode);
         let workspace = agent_workspace_display(&self.project_path);
         let user = format!(
-            "User request:\n{message}\n\nSkill context:\n{skill_context}\n\nAvailable tools: {}\n\nAgent workspace for generated files: {workspace}\n\nReturn JSON exactly like {{\"toolCalls\":[{{\"tool\":\"wiki.search\",\"query\":\"short query\"}}]}}. Use an empty array when no tool is needed. The skill context and tool list above are already available to the assistant; do not call wiki.search, source.search, graph.search, web.search, anytxt.search, skill.read_file, workspace.write_file, or shell.exec merely to list, explain, or summarize the currently available skills, tools, modes, or agent capabilities. Use wiki.search for factual or topical retrieval. Prefer graph.search for relationships, dependencies, neighborhoods, backlinks, or connections between entities; pass concise entity or concept names instead of the full question. The planner may select both when the answer needs page content and graph structure. Prefer web.search only for current/external information. Prefer anytxt.search only for user files outside the wiki. Use wiki.write_page only when the user explicitly asks to create a wiki page; include path under wiki/ ending in .md and full Markdown content. Existing pages are create-only by default; include allowOverwrite:true only when the user explicitly asks to overwrite or update an existing wiki page. Use skill.read_file for Markdown/reference files inside an active skill directory. Use workspace.write_file for generated artifacts under agent-workspace; do not inline large heredocs or generated file bodies inside shell.exec. Use shell.exec only when a relevant active skill requires a command-line operation after any large files have been written. shell.exec runs from the Agent workspace; commands that generate files must write them under that workspace and must not write to home, Desktop, Downloads, system temp folders, hidden app metadata folders, or skill installation folders.",
+            "User request:\n{message}\n\nSkill context:\n{skill_context}\n\nAvailable tools: {}\n\nAgent workspace for generated files: {workspace}\n\nReturn JSON exactly like {{\"toolCalls\":[{{\"tool\":\"wiki.search\",\"query\":\"short query\"}}]}}. Use an empty array when no tool is needed. The skill context and tool list above are already available to the assistant; do not call retrieval tools merely to list or explain capabilities. Use wiki.search first for factual or topical retrieval. Use gbrain.query only after published or projected wiki pages are insufficient; it is read-only and source-scoped. Prefer graph.search for relationships, dependencies, neighborhoods, backlinks, or connections between entities; pass concise entity or concept names instead of the full question. Prefer web.search only for current/external information. Prefer anytxt.search only for user files outside the wiki. Use wiki.write_page only when the user explicitly asks to create a wiki page; include path under wiki/ ending in .md and full Markdown content. Existing pages are create-only by default; include allowOverwrite:true only when the user explicitly asks to overwrite or update an existing wiki page. Use skill.read_file for Markdown/reference files inside an active skill directory. Use workspace.write_file for generated artifacts under agent-workspace; do not inline large heredocs or generated file bodies inside shell.exec. Use shell.exec only when a relevant active skill requires a command-line operation after any large files have been written. shell.exec runs from the Agent workspace; commands that generate files must write them under that workspace and must not write to home, Desktop, Downloads, system temp folders, hidden app metadata folders, or skill installation folders.",
             available.join(", "),
         );
         let client = LlmClient::new(config.clone())?
@@ -2469,6 +2674,34 @@ impl AgentRuntime {
         let raw = generate_with_cancellation(&client, system, &user, &[], cancellation).await?;
         parse_model_tool_plan(&raw)
     }
+}
+
+fn founder_gbrain_source_precedence() -> &'static [&'static str] {
+    &tools::FOUNDER_GBRAIN_SOURCES
+}
+
+fn founder_references_match_query(
+    references: &[tools::FounderRetrievalReference],
+    query: &str,
+) -> bool {
+    const STOP_WORDS: &[&str] = &[
+        "about", "answer", "cite", "does", "evidence", "explain", "from", "have", "page", "tell",
+        "that", "the", "this", "what", "which", "with",
+    ];
+    let terms = query
+        .split(|character: char| !character.is_alphanumeric())
+        .map(|term| term.to_lowercase())
+        .filter(|term| term.len() >= 4 && !STOP_WORDS.contains(&term.as_str()))
+        .collect::<BTreeSet<_>>();
+    !terms.is_empty()
+        && references.iter().any(|reference| {
+            let searchable = format!(
+                "{} {}",
+                reference.title.to_lowercase(),
+                reference.evidence_snippet.to_lowercase()
+            );
+            terms.iter().any(|term| searchable.contains(term))
+        })
 }
 
 fn agent_structured_max_tokens(has_skills: bool) -> u32 {
@@ -2847,6 +3080,7 @@ fn is_agent_retrieval_tool(tool: &str) -> bool {
         tool,
         "wiki.search"
             | "wiki.read_page"
+            | "gbrain.query"
             | "source.search"
             | "graph.search"
             | "web.search"
@@ -3028,6 +3262,7 @@ fn build_agent_loop_user(
             out.push_str("- source.search: search raw source excerpts. This is the only retrieval tool permitted in faithful-source mode.\n");
         } else {
             out.push_str("- wiki.search: retrieve wiki pages for factual or topical questions.\n");
+            out.push_str("- gbrain.query: read-only founder evidence fallback. Use only after published and projected wiki pages are insufficient.\n");
             out.push_str("- wiki.read_page: read a specific wiki markdown page by path.\n");
             out.push_str("- source.search: search raw source snippets.\n");
             out.push_str("- graph.search: retrieve relationships, neighbors, backlinks, dependencies, and connections between entities. Prefer it for relational questions and query with concise entity or concept names.\n");
@@ -3141,6 +3376,7 @@ fn is_agent_loop_tool_name(value: &str) -> bool {
         "wiki.search"
             | "wiki.read_page"
             | "wiki.write_page"
+            | "gbrain.query"
             | "source.search"
             | "graph.search"
             | "web.search"
@@ -3400,7 +3636,8 @@ fn render_observations(observations: &[AgentObservation]) -> String {
 
 fn summarize_tool_input(tool: &str, input: &Value) -> Option<String> {
     match tool {
-        "wiki.search" | "source.search" | "graph.search" | "web.search" | "anytxt.search" => input
+        "wiki.search" | "gbrain.query" | "source.search" | "graph.search" | "web.search"
+        | "anytxt.search" => input
             .get("query")
             .and_then(Value::as_str)
             .map(str::to_string),
@@ -3524,7 +3761,12 @@ fn require_tool_permission(
     if request.retrieval_mode == AgentRetrievalMode::Faithful
         && matches!(
             tool,
-            "wiki.search" | "wiki.read_page" | "graph.search" | "web.search" | "anytxt.search"
+            "wiki.search"
+                | "wiki.read_page"
+                | "gbrain.query"
+                | "graph.search"
+                | "web.search"
+                | "anytxt.search"
         )
     {
         return Err(format!(
@@ -3537,6 +3779,12 @@ fn require_tool_permission(
                 return Err("wiki.search is disabled for this turn".to_string());
             }
             permission_policy.require(AgentCapability::SearchWiki)
+        }
+        "gbrain.query" => {
+            if !request.tools.wiki {
+                return Err("gbrain.query is disabled for this turn".to_string());
+            }
+            permission_policy.require(AgentCapability::ReadSource)
         }
         "wiki.read_page" | "graph.search" => {
             if !request.tools.wiki {
@@ -3801,6 +4049,7 @@ fn planned_tool_queries(plan: &ModelToolPlan, fallback_query: &str) -> BTreeMap<
         if !matches!(
             tool,
             "wiki.search"
+                | "gbrain.query"
                 | "source.search"
                 | "graph.search"
                 | "web.search"
@@ -3975,6 +4224,16 @@ where
     }
 }
 
+fn is_local_founder_synthesis_config(config: &LlmConfig) -> bool {
+    if config.provider != "ollama" || config.model.trim().is_empty() {
+        return false;
+    }
+    let endpoint = config.ollama_url.trim().to_ascii_lowercase();
+    endpoint.starts_with("http://127.0.0.1")
+        || endpoint.starts_with("http://localhost")
+        || endpoint.starts_with("http://[::1]")
+}
+
 fn build_retrieval_answer(query: &str, references: &[AgentReference]) -> String {
     if references.is_empty() {
         return format!(
@@ -4015,6 +4274,87 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn founder_gbrain_precedence_is_canonical_then_projected_then_evidence() {
+        assert_eq!(
+            founder_gbrain_source_precedence(),
+            [
+                "frankbrain",
+                "gdrive-workspaces",
+                "faos-projects",
+                "default"
+            ],
+        );
+    }
+
+    #[test]
+    fn local_only_founder_synthesis_allows_only_loopback_ollama() {
+        let local = LlmConfig {
+            provider: "ollama".to_string(),
+            api_key: String::new(),
+            model: "qwen3".to_string(),
+            ollama_url: "http://127.0.0.1:11434".to_string(),
+            custom_endpoint: String::new(),
+            azure_api_version: None,
+            azure_model_family: None,
+            api_mode: None,
+            reasoning: None,
+            max_tokens: None,
+            max_context_size: None,
+            custom_headers: Default::default(),
+            streaming_enabled: None,
+        };
+        assert!(is_local_founder_synthesis_config(&local));
+        assert!(!is_local_founder_synthesis_config(&LlmConfig {
+            provider: "openai".to_string(),
+            api_key: "key".to_string(),
+            ..local.clone()
+        }));
+        assert!(!is_local_founder_synthesis_config(&LlmConfig {
+            ollama_url: "http://ollama.example.test:11434".to_string(),
+            ..local
+        }));
+    }
+
+    #[test]
+    fn founder_precedence_requires_title_evidence_not_any_vector_neighbor() {
+        let unrelated = vec![tools::FounderRetrievalReference {
+            title: "Provider Abstraction".to_string(),
+            path: "wiki/concepts/provider-abstraction.md".to_string(),
+            source: "frankbrain".to_string(),
+            version_or_hash: "unknown".to_string(),
+            evidence_snippet: String::new(),
+        }];
+        let matching = vec![tools::FounderRetrievalReference {
+            title: "Pivotal Digital Transformation Forum".to_string(),
+            path: "gbrain://gdrive-workspaces/pivotal".to_string(),
+            source: "gdrive-workspaces".to_string(),
+            version_or_hash: "unknown".to_string(),
+            evidence_snippet: String::new(),
+        }];
+
+        assert!(!founder_references_match_query(
+            &unrelated,
+            "What is the Pivotal digital transformation forum? Cite the evidence."
+        ));
+        assert!(founder_references_match_query(
+            &matching,
+            "What is the Pivotal digital transformation forum? Cite the evidence."
+        ));
+
+        let snippet_match = vec![tools::FounderRetrievalReference {
+            title: "Imported document".to_string(),
+            path: "gbrain://gdrive-workspaces/pivotal".to_string(),
+            source: "gdrive-workspaces".to_string(),
+            version_or_hash: "unknown".to_string(),
+            evidence_snippet: "Pivotal Digital Transformation Forum".to_string(),
+        }];
+        assert!(founder_references_match_query(
+            &snippet_match,
+            "What is the Pivotal digital transformation forum? Cite the evidence."
+        ));
+    }
     use crate::agent::types::{AgentMode, AgentToolOptions};
 
     fn temp_project(name: &str) -> PathBuf {

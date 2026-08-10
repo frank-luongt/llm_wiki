@@ -60,6 +60,18 @@ describe("source-lifecycle path helpers", () => {
     expect(isIngestableSourcePath("C:\\project\\raw\\sources\\book.MOBI")).toBe(true)
   })
 
+  it("accepts AnyDoc Office and RTF source variants", () => {
+    for (const path of [
+      "report.docm",
+      "deck.ppt",
+      "show.ppsm",
+      "workbook.xlsb",
+      "notes.rtf",
+    ]) {
+      expect(isIngestableSourcePath(`raw/sources/${path}`)).toBe(true)
+    }
+  })
+
   it("derives folder context from absolute raw/sources paths without leaking the project prefix", () => {
     expect(
       folderContextForSourcePath("/tmp/project/raw/sources/reports/2026/report.pdf"),
