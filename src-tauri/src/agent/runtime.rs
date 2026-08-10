@@ -1322,7 +1322,31 @@ impl AgentRuntime {
             self.llm_config.as_ref(),
         );
 
-        let answer = if let Some(config) = self
+        let has_local_only_founder_evidence = references
+            .iter()
+            .any(|reference| reference.kind.eq_ignore_ascii_case("gbrain"));
+        let answer = if has_local_only_founder_evidence
+            && self
+                .llm_config
+                .as_ref()
+                .is_some_and(|config| !is_local_founder_synthesis_config(config))
+        {
+            // The backend Agent path can call HTTP providers directly, bypassing
+            // the frontend preset selector.  Do not serialize gbrain evidence
+            // into a frontier request: return the grounded local retrieval until
+            // an explicit local Ollama configuration is available.
+            tool_emit_event(
+                &mut tool_events,
+                &mut events,
+                &event_sink,
+                AgentToolEvent {
+                    tool: "llm.generate".to_string(),
+                    status: "skipped".to_string(),
+                    detail: Some("local_only founder evidence requires local Ollama synthesis".to_string()),
+                },
+            );
+            retrieval_summary
+        } else if let Some(config) = self
             .llm_config
             .as_ref()
             .filter(|cfg| cfg.is_usable_for_backend_http())
@@ -4200,6 +4224,16 @@ where
     }
 }
 
+fn is_local_founder_synthesis_config(config: &LlmConfig) -> bool {
+    if config.provider != "ollama" || config.model.trim().is_empty() {
+        return false;
+    }
+    let endpoint = config.ollama_url.trim().to_ascii_lowercase();
+    endpoint.starts_with("http://127.0.0.1")
+        || endpoint.starts_with("http://localhost")
+        || endpoint.starts_with("http://[::1]")
+}
+
 fn build_retrieval_answer(query: &str, references: &[AgentReference]) -> String {
     if references.is_empty() {
         return format!(
@@ -4252,6 +4286,35 @@ mod tests {
                 "default"
             ],
         );
+    }
+
+    #[test]
+    fn local_only_founder_synthesis_allows_only_loopback_ollama() {
+        let local = LlmConfig {
+            provider: "ollama".to_string(),
+            api_key: String::new(),
+            model: "qwen3".to_string(),
+            ollama_url: "http://127.0.0.1:11434".to_string(),
+            custom_endpoint: String::new(),
+            azure_api_version: None,
+            azure_model_family: None,
+            api_mode: None,
+            reasoning: None,
+            max_tokens: None,
+            max_context_size: None,
+            custom_headers: Default::default(),
+            streaming_enabled: None,
+        };
+        assert!(is_local_founder_synthesis_config(&local));
+        assert!(!is_local_founder_synthesis_config(&LlmConfig {
+            provider: "openai".to_string(),
+            api_key: "key".to_string(),
+            ..local.clone()
+        }));
+        assert!(!is_local_founder_synthesis_config(&LlmConfig {
+            ollama_url: "http://ollama.example.test:11434".to_string(),
+            ..local
+        }));
     }
 
     #[test]
