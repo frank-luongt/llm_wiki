@@ -157,10 +157,16 @@ export async function streamCodexCli(
   const abortListener = () => {
     aborted = true
     void invoke("codex_cli_kill", { streamId }).catch(() => {})
-    finishWith(onDone)
+    finishWith(() => {
+      activity.updateItem(activityId, { status: "done", detail: "Cancelled." })
+      onDone()
+    })
   }
   if (aborted) {
-    finishWith(onDone)
+    finishWith(() => {
+      activity.updateItem(activityId, { status: "done", detail: "Cancelled." })
+      onDone()
+    })
     return
   }
   signal?.addEventListener("abort", abortListener)
@@ -247,7 +253,10 @@ export async function streamCodexCli(
     if (aborted || signal?.aborted) {
       aborted = true
       await invoke("codex_cli_kill", { streamId }).catch(() => {})
-      finishWith(onDone)
+      finishWith(() => {
+        activity.updateItem(activityId, { status: "done", detail: "Cancelled." })
+        onDone()
+      })
       return
     }
     await completion

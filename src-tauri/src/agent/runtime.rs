@@ -767,7 +767,11 @@ impl AgentRuntime {
         // source-scoped gbrain evidence. Never broaden to gbrain while wiki
         // already supplied a usable citation unless the planner explicitly
         // requested the governed fallback.
-        if request.tools.wiki && (references.is_empty() || should_query_gbrain) {
+        // A governed gbrain fallback is meaningful only when the planner
+        // explicitly asked for it or an actual wiki search completed with no
+        // usable citations.  Do not turn greetings or router-skipped turns
+        // into source-scoped founder retrieval.
+        if request.tools.wiki && (should_query_gbrain || (should_search_wiki && references.is_empty())) {
             check_cancel(cancellation.as_ref())?;
             permission_policy.require(AgentCapability::ReadSource)?;
             let gbrain_query = planned_queries
