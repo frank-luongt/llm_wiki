@@ -52,6 +52,9 @@ jobs:
       - name: Check frontend build
         run: npx vite build
 
+      - name: Run default test suite
+        run: npm test
+
       - name: Prepare MCP server resources
         run: |
           npm --prefix mcp-server ci

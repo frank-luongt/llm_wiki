@@ -837,7 +837,7 @@
         "mcpEnable": "启用 MCP 访问",
         "mcpEnableHint": "MCP 复用本地 API 和同一套 token 规则。保持 HTTP API 启用后，将 MCP 客户端连接到内置 Node 服务即可。",
         "mcpUsage": "MCP 使用说明",
-        "mcpUsageHint": "先执行一次 `npm run mcp:build`，然后让 MCP 客户端运行下面的服务配置。除非启用了无认证访问，否则需要设置 LLM_WIKI_API_TOKEN。",
+        "mcpUsageHint": "先执行一次 `npm run mcp:build`，然后让 MCP 客户端运行下面的服务配置。请替换 LLM_WIKI_API_TOKEN 占位值：无认证访问仅适用于只读工具；对话和单页向量化工具仍然需要 token。",
         "mcpPathUnavailable": "没有找到 MCP 服务入口。请在 LLM Wiki 仓库中先执行 `npm run mcp:build`，然后重新打开设置。",
         "token": "访问令牌",
         "tokenHint": "通过 `Authorization: Bearer <token>` 或 `X-LLM-Wiki-Token: <token>` 发送。启用无认证访问后，读取类接口可以省略 token，但 Agent 对话、取消和单页向量化接口始终需要 token。环境变量 LLM_WIKI_API_TOKEN 优先生效。",

@@ -10,9 +10,8 @@ It does **not** scan project folders directly and does **not** copy the app's se
 - LLM Wiki desktop app running
 - Settings → API + MCP → "Enable local HTTP API"
 - Settings → API + MCP → "Enable MCP access"
-- Either:
-  - Settings → API + MCP → "Allow access without a token", or
-  - `LLM_WIKI_API_TOKEN` set to the configured API token
+- `LLM_WIKI_API_TOKEN` set to the configured API token. Enabling "Allow access without a token"
+  opens only read-oriented tools; `llm_wiki_chat` and `llm_wiki_embed_page` remain privileged.
 
 Optional:
 
@@ -48,7 +47,7 @@ Example MCP client config:
 }
 ```
 
-When API unauthenticated mode is enabled, omit `LLM_WIKI_API_TOKEN`. If MCP access is disabled in Settings, `llm_wiki_status` still works for diagnosis but other tools return an explicit disabled error.
+Always replace the `LLM_WIKI_API_TOKEN` placeholder when configuring the full MCP server. API unauthenticated mode applies only to read-oriented tools; privileged chat and page-embedding tools still require the token. If MCP access is disabled in Settings, `llm_wiki_status` still works for diagnosis but other tools return an explicit disabled error.
 
 ## Tools
 
@@ -60,6 +59,7 @@ When API unauthenticated mode is enabled, omit `LLM_WIKI_API_TOKEN`. If MCP acce
 - `llm_wiki_reviews`: list Review tab items. Defaults to unresolved items and supports `status`, `type`, and `limit` filters.
 - `llm_wiki_search`: search with the app's shared keyword/vector backend.
 - `llm_wiki_chat`: ask the backend Agent chat endpoint and receive answer text, references, usage, and tool events. `mode: deep` broadens backend evidence collection; full Deep Research workflows still live in the desktop app.
+- `llm_wiki_embed_page`: rebuild vectors for one page. This privileged tool always requires the configured token.
 - `llm_wiki_graph`: query the app's knowledge graph endpoint.
 - `llm_wiki_rescan_sources`: trigger a Source Watch rescan using the user's configured rules.
 
@@ -68,7 +68,7 @@ When API unauthenticated mode is enabled, omit `LLM_WIKI_API_TOKEN`. If MCP acce
 The MCP server inherits the desktop API's security model:
 
 - It only talks to `127.0.0.1` by default.
-- It uses the same API token or unauthenticated setting as Settings → API + MCP.
+- Read-oriented tools use the same API token or unauthenticated setting as Settings → API + MCP. Privileged chat and page-embedding tools always require the token.
 - File reads go through the API path allow-list. Internal app state files are not exposed.
 - Review data is exposed only through the dedicated Review endpoint/tool, which defaults to unresolved items rather than opening internal state files directly.
 - Search and graph tools operate on projects known to the app; use `project_id: "current"` for the active project.

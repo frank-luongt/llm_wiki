@@ -16,9 +16,11 @@
  *     text wire would break every existing call site.
  */
 import { describe, it, expect } from "vitest"
+import originPolicyCases from "../../test-fixtures/local-origin-policy.json"
 import {
   buildAnthropicUrl,
   getProviderConfig,
+  localLlmOriginHeader,
   parseAnthropicResponse,
   parseGoogleResponse,
   parseOpenAiResponse,
@@ -30,6 +32,16 @@ import type { LlmConfig } from "@/stores/wiki-store"
 
 const TINY_PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABXvMqOgAAAABJRU5ErkJggg=="
+
+describe("local LLM Origin header", () => {
+  it("matches the shared loopback and private-LAN compatibility corpus", () => {
+    for (const { endpoint, origin } of originPolicyCases) {
+      expect(localLlmOriginHeader(endpoint), endpoint).toEqual(
+        origin === null ? {} : { Origin: origin },
+      )
+    }
+  })
+})
 
 function mkConfig(over: Partial<LlmConfig>): LlmConfig {
   return {

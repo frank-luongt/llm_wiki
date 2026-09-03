@@ -1076,7 +1076,7 @@ pub(crate) async fn fetch_embedding_with_retry(
             Ok(embedding) => return Ok(embedding),
             Err(EmbeddingFetchError::Oversize(message)) => {
                 if attempts <= max_retries
-                    && current.len() > 64
+                    && current.chars().count() > 64
                     && halve_text_on_char_boundary(&mut current)
                 {
                     eprintln!(
@@ -1089,7 +1089,7 @@ pub(crate) async fn fetch_embedding_with_retry(
                 }
                 return Err(format!(
                     "Endpoint rejected input even at {} chars. Lower Settings -> Embedding -> Max Chunk Chars. {message}",
-                    current.len()
+                    current.chars().count()
                 ));
             }
             Err(EmbeddingFetchError::Other(message)) => return Err(message),
@@ -1111,7 +1111,7 @@ pub(crate) async fn fetch_embedding_batch(
     }
 
     let endpoint = volcengine_embedding_endpoint(cfg);
-    let mut req = crate::proxy::configure_http_client(reqwest::Client::builder())
+    let req = crate::proxy::configure_http_client(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(
             SEARCH_EMBEDDING_TIMEOUT_SECS,
         ))
@@ -1119,9 +1119,7 @@ pub(crate) async fn fetch_embedding_batch(
         .map_err(|e| format!("Embedding HTTP client error: {e}"))?
         .post(&endpoint)
         .header("Content-Type", "application/json");
-    if is_local_or_private_http_endpoint(&endpoint) {
-        req = req.header("Origin", "http://localhost");
-    }
+    let mut req = apply_local_endpoint_origin(req, &endpoint);
     if !cfg.api_key.trim().is_empty() {
         req = req.bearer_auth(cfg.api_key.trim());
     }
@@ -1237,6 +1235,19 @@ async fn fetch_embedding_once(
     text: &str,
     cfg: &SearchEmbeddingConfig,
 ) -> Result<Vec<f32>, EmbeddingFetchError> {
+    fetch_embedding_once_with_timeout(
+        text,
+        cfg,
+        std::time::Duration::from_secs(SEARCH_EMBEDDING_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn fetch_embedding_once_with_timeout(
+    text: &str,
+    cfg: &SearchEmbeddingConfig,
+    timeout: std::time::Duration,
+) -> Result<Vec<f32>, EmbeddingFetchError> {
     let is_google = is_google_embedding_config(cfg);
     let is_doubao_multimodal = is_doubao_multimodal_embedding_config(cfg);
     let endpoint = if is_google {
@@ -1244,10 +1255,8 @@ async fn fetch_embedding_once(
     } else {
         volcengine_embedding_endpoint(cfg)
     };
-    let mut req = crate::proxy::configure_http_client(reqwest::Client::builder())
-        .timeout(std::time::Duration::from_secs(
-            SEARCH_EMBEDDING_TIMEOUT_SECS,
-        ))
+    let req = crate::proxy::configure_http_client(reqwest::Client::builder())
+        .timeout(timeout)
         .build()
         .map_err(|e| EmbeddingFetchError::Other(format!("Embedding HTTP client error: {e}")))?
         .post(&endpoint)
@@ -1255,9 +1264,7 @@ async fn fetch_embedding_once(
     // Browser-based local model servers often require a browser-like
     // Origin even when the request is routed through Rust. Keep this
     // reserved so user-supplied extra headers cannot override it.
-    if is_local_or_private_http_endpoint(&endpoint) {
-        req = req.header("Origin", "http://localhost");
-    }
+    let mut req = apply_local_endpoint_origin(req, &endpoint);
     if !cfg.api_key.trim().is_empty() {
         if is_google {
             req = req.header("x-goog-api-key", cfg.api_key.trim());
@@ -1406,37 +1413,43 @@ fn is_google_embedding_config(cfg: &SearchEmbeddingConfig) -> bool {
     endpoint.contains("generativelanguage.googleapis.com") || endpoint.contains(":embedcontent")
 }
 
-fn is_local_or_private_http_endpoint(endpoint: &str) -> bool {
+fn local_endpoint_origin(endpoint: &str) -> Option<String> {
     let Ok(url) = reqwest::Url::parse(endpoint) else {
-        return false;
+        return None;
     };
     if !matches!(url.scheme(), "http" | "https") {
-        return false;
+        return None;
     }
     let Some(host) = url.host_str() else {
-        return false;
+        return None;
     };
     let host = host
         .trim_matches('[')
         .trim_matches(']')
         .to_ascii_lowercase();
-    if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") {
-        return true;
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
+    {
+        return Some(url.origin().ascii_serialization());
     }
-    let octets = host
-        .split('.')
-        .map(str::parse::<u8>)
-        .collect::<Result<Vec<_>, _>>();
-    let Ok(octets) = octets else {
-        return false;
-    };
-    if octets.len() != 4 {
-        return false;
+    host.parse::<std::net::Ipv4Addr>()
+        .ok()
+        .filter(std::net::Ipv4Addr::is_private)
+        .map(|_| "http://localhost".to_string())
+}
+
+fn apply_local_endpoint_origin(
+    request: reqwest::RequestBuilder,
+    endpoint: &str,
+) -> reqwest::RequestBuilder {
+    match local_endpoint_origin(endpoint) {
+        Some(origin) => request.header("Origin", origin),
+        None => request,
     }
-    octets[0] == 10
-        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-        || (octets[0] == 192 && octets[1] == 168)
-        || octets[0] == 127
 }
 
 fn is_volcengine_embedding_endpoint(endpoint: &str) -> bool {
@@ -1658,8 +1671,24 @@ fn file_stem(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tiny_http::{Response, Server, StatusCode};
+
+    #[derive(Deserialize)]
+    struct OriginPolicyCase {
+        endpoint: String,
+        origin: Option<String>,
+    }
+
+    fn origin_policy_cases() -> Vec<OriginPolicyCase> {
+        serde_json::from_str(include_str!(
+            "../../../test-fixtures/local-origin-policy.json"
+        ))
+        .unwrap()
+    }
 
     fn tmp_project() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1687,6 +1716,295 @@ mod tests {
             images: vec![],
             content: None,
             graph_related_to: Vec::new(),
+        }
+    }
+
+    fn fake_embedding_server(
+        max_input_chars: usize,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<usize>>>,
+        Arc<Mutex<Vec<Option<String>>>>,
+        Arc<Server>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let address = server.server_addr().to_ip().unwrap();
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let captured_sizes = Arc::clone(&sizes);
+        let origins = Arc::new(Mutex::new(Vec::new()));
+        let captured_origins = Arc::clone(&origins);
+        let serving = Arc::clone(&server);
+        let task = tokio::task::spawn_blocking(move || {
+            for mut request in serving.incoming_requests() {
+                let origin = request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("Origin"))
+                    .map(|header| header.value.as_str().to_string());
+                captured_origins.lock().unwrap().push(origin);
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                let input_length = payload["input"].as_str().unwrap().chars().count();
+                captured_sizes.lock().unwrap().push(input_length);
+                let (status, response_body) = if input_length > max_input_chars {
+                    (
+                        StatusCode(400),
+                        json!({"error": format!("input length {input_length} exceeds maximum context {max_input_chars}")}).to_string(),
+                    )
+                } else {
+                    (
+                        StatusCode(200),
+                        json!({"data": [{"embedding": [0.1, 0.2, 0.3]}]}).to_string(),
+                    )
+                };
+                if request
+                    .respond(Response::from_string(response_body).with_status_code(status))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        (
+            format!("http://{address}/v1/embeddings"),
+            sizes,
+            origins,
+            server,
+            task,
+        )
+    }
+
+    fn embedding_config(endpoint: String) -> SearchEmbeddingConfig {
+        SearchEmbeddingConfig {
+            enabled: true,
+            endpoint,
+            api_key: String::new(),
+            model: "fake-embed".to_string(),
+            output_dimensionality: None,
+            extra_headers: None,
+            max_chunk_chars: None,
+            overlap_chunk_chars: None,
+        }
+    }
+
+    fn single_response_server<R: io::Read + Send + 'static>(
+        response: Response<R>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let task = tokio::task::spawn_blocking(move || {
+            let request = server.recv().unwrap();
+            let _ = request.respond(response);
+        });
+        (format!("http://{address}/v1/embeddings"), task)
+    }
+
+    fn origin_capture_server(
+        response_body: Value,
+    ) -> (
+        String,
+        Arc<Mutex<Option<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let origin = Arc::new(Mutex::new(None));
+        let captured_origin = Arc::clone(&origin);
+        let task = tokio::task::spawn_blocking(move || {
+            let mut request = server.recv().unwrap();
+            *captured_origin.lock().unwrap() = request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv("Origin"))
+                .map(|header| header.value.as_str().to_string());
+            let mut request_body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut request_body)
+                .unwrap();
+            let _: Value = serde_json::from_str(&request_body).unwrap();
+            request
+                .respond(Response::from_string(response_body.to_string()))
+                .unwrap();
+        });
+        (format!("http://{address}/v1/embeddings"), origin, task)
+    }
+
+    struct ResetBody;
+
+    impl io::Read for ResetBody {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "intentional test reset",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_http_retries_oversize_until_vector_success() {
+        let (endpoint, sizes, origins, server, task) = fake_embedding_server(200);
+        let expected_origin = reqwest::Url::parse(&endpoint)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        let result = fetch_embedding_with_retry(&"a".repeat(800), &embedding_config(endpoint), 3)
+            .await
+            .unwrap();
+        server.unblock();
+        task.await.unwrap();
+        assert_eq!(result, vec![0.1, 0.2, 0.3]);
+        assert_eq!(*sizes.lock().unwrap(), vec![800, 400, 200]);
+        assert_eq!(
+            *origins.lock().unwrap(),
+            vec![
+                Some(expected_origin.clone()),
+                Some(expected_origin.clone()),
+                Some(expected_origin),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_batch_sends_loopback_origin_on_wire() {
+        let (endpoint, origin, task) = origin_capture_server(json!({
+            "data": [
+                {"index": 0, "embedding": [0.1, 0.2]},
+                {"index": 1, "embedding": [0.3, 0.4]}
+            ]
+        }));
+        let expected_origin = reqwest::Url::parse(&endpoint)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+
+        let vectors = fetch_embedding_batch(
+            &["first".to_string(), "second".to_string()],
+            &embedding_config(endpoint),
+        )
+        .await
+        .unwrap();
+        task.await.unwrap();
+
+        assert_eq!(vectors, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+        assert_eq!(*origin.lock().unwrap(), Some(expected_origin));
+    }
+
+    #[tokio::test]
+    async fn shared_lan_and_localhost_origins_are_sent_on_wire() {
+        let cases = origin_policy_cases();
+        let selected: Vec<_> = cases
+            .iter()
+            .filter(|case| {
+                case.endpoint == "http://192.168.1.20:11434/v1"
+                    || case.endpoint == "https://model.localhost:443/api"
+                    || case.endpoint == "http://[::1]:11434/v1"
+            })
+            .collect();
+        assert_eq!(selected.len(), 3, "shared Origin policy probes changed");
+        for case in selected {
+            let (receiver, origin, task) =
+                origin_capture_server(json!({"data": [{"embedding": [0.1]}]}));
+            let request = reqwest::Client::new()
+                .post(receiver)
+                .header("Content-Type", "application/json");
+            apply_local_endpoint_origin(request, &case.endpoint)
+                .json(&json!({"input": "probe"}))
+                .send()
+                .await
+                .unwrap();
+            task.await.unwrap();
+            assert_eq!(*origin.lock().unwrap(), case.origin, "{}", case.endpoint);
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_http_reports_retry_budget_exhaustion() {
+        let (endpoint, sizes, _origins, server, task) = fake_embedding_server(50);
+        let error = fetch_embedding_with_retry(&"a".repeat(2048), &embedding_config(endpoint), 3)
+            .await
+            .unwrap_err();
+        server.unblock();
+        task.await.unwrap();
+        assert_eq!(*sizes.lock().unwrap(), vec![2048, 1024, 512, 256]);
+        assert!(error.contains("Endpoint rejected input even at 256 chars"));
+        assert!(error.contains("Lower Settings -> Embedding -> Max Chunk Chars"));
+    }
+
+    #[tokio::test]
+    async fn embedding_http_stops_at_the_64_character_floor() {
+        let (endpoint, sizes, _origins, server, task) = fake_embedding_server(0);
+        let error = fetch_embedding_with_retry(&"a".repeat(128), &embedding_config(endpoint), 3)
+            .await
+            .unwrap_err();
+        server.unblock();
+        task.await.unwrap();
+        assert_eq!(*sizes.lock().unwrap(), vec![128, 64]);
+        assert!(error.contains("Endpoint rejected input even at 64 chars"));
+    }
+
+    #[tokio::test]
+    async fn embedding_http_uses_character_floor_for_multibyte_input() {
+        let (endpoint, sizes, _origins, server, task) = fake_embedding_server(0);
+        let error = fetch_embedding_with_retry(&"界".repeat(128), &embedding_config(endpoint), 3)
+            .await
+            .unwrap_err();
+        server.unblock();
+        task.await.unwrap();
+        assert_eq!(*sizes.lock().unwrap(), vec![128, 64]);
+        assert!(error.contains("Endpoint rejected input even at 64 chars"));
+    }
+
+    #[tokio::test]
+    async fn embedding_http_surfaces_a_stalled_response_timeout() {
+        struct StalledBody;
+
+        impl io::Read for StalledBody {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(0)
+            }
+        }
+
+        let response = Response::new(StatusCode(200), Vec::new(), StalledBody, None, None);
+        let (endpoint, task) = single_response_server(response);
+        let error = fetch_embedding_once_with_timeout(
+            "hello",
+            &embedding_config(endpoint),
+            std::time::Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+        task.await.unwrap();
+        assert!(
+            matches!(error, EmbeddingFetchError::Other(message) if message.contains("Embedding response read failed") || message.contains("Embedding request failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_http_surfaces_a_reset_response_body() {
+        let response = Response::new(StatusCode(200), Vec::new(), ResetBody, Some(64), None);
+        let (endpoint, task) = single_response_server(response);
+        let error = fetch_embedding_once("hello", &embedding_config(endpoint))
+            .await
+            .unwrap_err();
+        task.await.unwrap();
+        assert!(
+            matches!(error, EmbeddingFetchError::Other(message) if message.contains("Embedding response read failed") || message.contains("Embedding request failed"))
+        );
+    }
+
+    #[test]
+    fn local_endpoint_origin_matches_shared_compatibility_corpus() {
+        for case in origin_policy_cases() {
+            assert_eq!(
+                local_endpoint_origin(&case.endpoint),
+                case.origin,
+                "{}",
+                case.endpoint
+            );
         }
     }
 
@@ -1901,18 +2219,10 @@ mod tests {
 
     #[test]
     fn embedding_origin_header_is_limited_to_local_or_private_endpoints() {
-        assert!(is_local_or_private_http_endpoint(
-            "http://127.0.0.1:1234/v1/embeddings"
-        ));
-        assert!(is_local_or_private_http_endpoint(
-            "http://192.168.1.20:11434/v1/embeddings"
-        ));
-        assert!(is_local_or_private_http_endpoint(
-            "http://172.16.0.5/v1/embeddings"
-        ));
-        assert!(!is_local_or_private_http_endpoint(
-            "https://api.openai.com/v1/embeddings"
-        ));
+        assert!(local_endpoint_origin("http://127.0.0.1:1234/v1/embeddings").is_some());
+        assert!(local_endpoint_origin("http://192.168.1.20:11434/v1/embeddings").is_some());
+        assert!(local_endpoint_origin("http://172.16.0.5/v1/embeddings").is_some());
+        assert!(local_endpoint_origin("https://api.openai.com/v1/embeddings").is_none());
     }
 
     #[test]

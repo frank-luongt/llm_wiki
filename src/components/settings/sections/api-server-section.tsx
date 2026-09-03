@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import {
   Copy,
-  Eye,
-  EyeOff,
   ExternalLink,
   RefreshCw,
   Server,
@@ -58,9 +56,42 @@ export const API_ENDPOINTS: Array<{ method: "GET" | "POST" | "PATCH"; path: stri
   { method: "POST", path: "/api/v1/projects/{id}/chat/{sessionId}/cancel", noteKey: "endpointChatCancelNote" },
 ]
 
+export function buildApiCurlExample(allowUnauthenticated: boolean): string {
+  if (allowUnauthenticated) {
+    return `curl ${API_SERVER_BASE_URL}/api/v1/projects`
+  }
+  return `curl -H "Authorization: Bearer <your-token>" ${API_SERVER_BASE_URL}/api/v1/projects`
+}
+
+export function buildChatCurlExample(): string {
+  return `curl -N -X POST \\
+  -H "Authorization: Bearer <your-token>" \\
+  -H 'Content-Type: application/json' \\
+  -H 'Accept: text/event-stream' \\
+  ${API_SERVER_BASE_URL}/api/v1/projects/current/chat \\
+  -d '{"message":"Summarize this knowledge base.","stream":true}'`
+}
+
+export function buildMcpConfigExample(
+  mcpEntryPath: string,
+): string {
+  return JSON.stringify(
+    {
+      mcpServers: {
+        "llm-wiki": {
+          command: "node",
+          args: [mcpEntryPath],
+          env: { LLM_WIKI_API_TOKEN: "<your-token>" },
+        },
+      },
+    },
+    null,
+    2,
+  )
+}
+
 export function ApiServerSection({ draft, setDraft }: Props) {
   const { t } = useTranslation()
-  const [showToken, setShowToken] = useState(false)
   const [copiedField, setCopiedField] = useState<"token" | "curl" | "chat" | "mcp" | null>(null)
   const [serverStatus, setServerStatus] = useState<string>("...")
   const [health, setHealth] = useState<ApiHealth | null>(null)
@@ -103,7 +134,6 @@ export function ApiServerSection({ draft, setDraft }: Props) {
 
   const handleGenerate = useCallback(() => {
     setDraft("apiToken", generateApiToken())
-    setShowToken(true)
   }, [setDraft])
 
   const handleCopyToken = useCallback(async () => {
@@ -118,51 +148,17 @@ export function ApiServerSection({ draft, setDraft }: Props) {
   }, [draft.apiToken])
 
   const sampleCurl = useMemo(() => {
-    if (draft.apiAllowUnauthenticated) {
-      return `curl ${API_SERVER_BASE_URL}/api/v1/projects`
-    }
-    // Show the user a complete, paste-runnable example. The Bearer
-    // header is the recommended auth (never put the token in URL
-    // query — it leaks into logs / shell history / Referer).
-    const tokenForExample = draft.apiToken || "<your-token>"
-    return `curl -H "Authorization: Bearer ${tokenForExample}" ${API_SERVER_BASE_URL}/api/v1/projects`
-  }, [draft.apiAllowUnauthenticated, draft.apiToken])
+    return buildApiCurlExample(draft.apiAllowUnauthenticated)
+  }, [draft.apiAllowUnauthenticated])
 
   const sampleChatCurl = useMemo(() => {
-    const tokenForExample = health?.tokenSource === "env"
-      ? "$LLM_WIKI_API_TOKEN"
-      : draft.apiToken || "<your-token>"
-    return `curl -N -X POST \\
-  -H "Authorization: Bearer ${tokenForExample}" \\
-  -H 'Content-Type: application/json' \\
-  -H 'Accept: text/event-stream' \\
-  ${API_SERVER_BASE_URL}/api/v1/projects/current/chat \\
-  -d '{"message":"Summarize this knowledge base.","stream":true}'`
-  }, [draft.apiToken, health?.tokenSource])
+    return buildChatCurlExample()
+  }, [])
 
   const sampleMcpConfig = useMemo(() => {
     if (!mcpEntryPath) return ""
-    const env = health?.tokenSource === "env"
-      ? { LLM_WIKI_API_TOKEN: "<same value as the LLM Wiki process environment>" }
-      : draft.apiToken
-        ? { LLM_WIKI_API_TOKEN: draft.apiToken }
-        : draft.apiAllowUnauthenticated
-          ? {}
-          : { LLM_WIKI_API_TOKEN: "<your-token>" }
-    return JSON.stringify(
-      {
-        mcpServers: {
-          "llm-wiki": {
-            command: "node",
-            args: [mcpEntryPath],
-            ...(Object.keys(env).length > 0 ? { env } : {}),
-          },
-        },
-      },
-      null,
-      2,
-    )
-  }, [draft.apiAllowUnauthenticated, draft.apiToken, health?.tokenSource, mcpEntryPath])
+    return buildMcpConfigExample(mcpEntryPath)
+  }, [mcpEntryPath])
 
   const hasUnsavedApiConfig =
     persistedApiConfig.enabled !== draft.apiEnabled ||
@@ -388,7 +384,7 @@ export function ApiServerSection({ draft, setDraft }: Props) {
         <div className="flex gap-2">
           <Input
             id="api-token-input"
-            type={showToken ? "text" : "password"}
+            type="password"
             value={draft.apiToken}
             onChange={(event) => setDraft("apiToken", event.target.value)}
             placeholder={t("settings.sections.apiServer.tokenPlaceholder", {
@@ -398,24 +394,6 @@ export function ApiServerSection({ draft, setDraft }: Props) {
             autoComplete="off"
             spellCheck={false}
           />
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            onClick={() => setShowToken((value) => !value)}
-            title={
-              showToken
-                ? t("settings.sections.apiServer.hide", { defaultValue: "Hide" })
-                : t("settings.sections.apiServer.show", { defaultValue: "Show" })
-            }
-            aria-label={
-              showToken
-                ? t("settings.sections.apiServer.hide", { defaultValue: "Hide" })
-                : t("settings.sections.apiServer.show", { defaultValue: "Show" })
-            }
-          >
-            {showToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-          </Button>
           <Button
             type="button"
             variant="outline"
@@ -656,7 +634,7 @@ export function ApiServerSection({ draft, setDraft }: Props) {
           <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
             {t("settings.sections.apiServer.mcpUsageHint", {
               defaultValue:
-                "Build once with `npm run mcp:build`, then configure your MCP client to run the server below. Use LLM_WIKI_API_TOKEN unless unauthenticated access is enabled.",
+                "Build once with `npm run mcp:build`, then configure your MCP client to run the server below. Replace the LLM_WIKI_API_TOKEN placeholder: unauthenticated access applies only to read-oriented tools; chat and page embedding still require a token.",
             })}
           </p>
           {mcpPathError && (

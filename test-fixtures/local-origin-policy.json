@@ -1,0 +1,13 @@
+[
+  { "endpoint": "http://localhost:80/v1", "origin": "http://localhost" },
+  { "endpoint": "https://model.localhost:443/api", "origin": "https://model.localhost" },
+  { "endpoint": "http://127.0.0.2:11434/v1", "origin": "http://127.0.0.2:11434" },
+  { "endpoint": "http://[::1]:11434/v1", "origin": "http://[::1]:11434" },
+  { "endpoint": "http://10.0.0.5:11434/v1", "origin": "http://localhost" },
+  { "endpoint": "https://172.31.255.1:443/v1", "origin": "http://localhost" },
+  { "endpoint": "http://192.168.1.20:11434/v1", "origin": "http://localhost" },
+  { "endpoint": "http://172.32.0.1/v1", "origin": null },
+  { "endpoint": "https://gateway.example.com/v1", "origin": null },
+  { "endpoint": "ftp://localhost/model", "origin": null },
+  { "endpoint": "not a url", "origin": null }
+]

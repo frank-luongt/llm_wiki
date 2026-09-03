@@ -91,9 +91,10 @@ async function fetchEmbeddingViaMockHttp(
   const isGoogle = isGoogleEmbeddingConfigForTest(config)
   const isDoubaoVision = config.model.toLowerCase().includes("doubao-embedding-vision")
   const endpoint = isGoogle ? googleEndpointForTest(config) : volcengineEndpointForTest(config)
+  const localOrigin = localOriginForTest(endpoint)
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    ...(isLocalEndpointForTest(endpoint) ? { Origin: "http://localhost" } : {}),
+    ...(localOrigin ? { Origin: localOrigin } : {}),
   }
   if (config.apiKey) {
     if (isGoogle) headers["x-goog-api-key"] = config.apiKey
@@ -173,17 +174,19 @@ function isGoogleEmbeddingConfigForTest(config: { endpoint: string }): boolean {
   return endpoint.includes("generativelanguage.googleapis.com") || endpoint.includes(":embedcontent")
 }
 
-function isLocalEndpointForTest(endpoint: string): boolean {
+function localOriginForTest(endpoint: string): string | null {
   try {
-    const host = new URL(endpoint).hostname
-    return host === "localhost"
-      || host === "127.0.0.1"
-      || host === "::1"
-      || /^10\./.test(host)
-      || /^192\.168\./.test(host)
-      || /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+    const url = new URL(endpoint)
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "")
+    if (host === "localhost" || host.endsWith(".localhost") || host === "::1" || /^127\./.test(host)) {
+      return url.origin
+    }
+    if (/^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host)) {
+      return "http://localhost"
+    }
+    return null
   } catch {
-    return false
+    return null
   }
 }
 
@@ -435,7 +438,7 @@ describe("fetchEmbedding — provider wire formats", () => {
     const headers = opts?.headers as Record<string, string>
     expect(url).toBe("http://127.0.0.1:1234/v1/embeddings")
     expect(headers.Authorization).toBeUndefined()
-    expect(headers.Origin).toBe("http://localhost")
+    expect(headers.Origin).toBe("http://127.0.0.1:1234")
     expect(headers["x-goog-api-key"]).toBeUndefined()
     expect(JSON.parse(String(opts?.body))).toEqual({
       model: "text-embedding-qwen3-embedding-0.6b",

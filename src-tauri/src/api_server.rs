@@ -24,7 +24,10 @@ const API_PREFIX: &str = "/api/v1";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_BODY_BYTES: usize = 40 * 1024 * 1024;
 const MAX_FILE_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
-const DEFAULT_MAX_FILES: usize = 2_000;
+// FrankBrain currently contains more than 5,700 public files. Keep the
+// default aligned with the already-enforced hard ceiling so the documented
+// endpoint works without a surprising 413 for a supported project size.
+const DEFAULT_MAX_FILES: usize = 10_000;
 const HARD_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_REVIEWS: usize = 200;
 const HARD_MAX_REVIEWS: usize = 1_000;
@@ -907,8 +910,8 @@ fn handle_files(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
         Ok(path) => path,
         Err(e) => return err(400, e),
     };
-    let mut count = 0;
-    match list_tree(&project.path, &dir, recursive, max_files, &mut count) {
+    let mut budget = FileListingBudget::default();
+    match list_tree(&project.path, &dir, recursive, max_files, &mut budget) {
         Ok(files) => ok(json!({
             "ok": true,
             "projectId": project.id,
@@ -1039,12 +1042,37 @@ struct ApiFileNode {
     children: Option<Vec<ApiFileNode>>,
 }
 
+#[derive(Default)]
+struct FileListingBudget {
+    files: usize,
+    directories: usize,
+}
+
+impl FileListingBudget {
+    fn record(&mut self, is_dir: bool, max_files: usize) -> Result<(), String> {
+        if is_dir {
+            self.directories += 1;
+            if self.directories > HARD_MAX_FILES {
+                return Err(format!(
+                    "File listing exceeds directory safety limit ({HARD_MAX_FILES})"
+                ));
+            }
+        } else {
+            self.files += 1;
+            if self.files > max_files {
+                return Err(format!("File listing exceeds maxFiles limit ({max_files})"));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn list_public_roots(
     project_path: &str,
     recursive: bool,
     max_files: usize,
 ) -> Result<Vec<ApiFileNode>, String> {
-    let mut count = 0;
+    let mut budget = FileListingBudget::default();
     let mut roots = Vec::new();
     for rel in ["purpose.md", "schema.md", "wiki", "raw/sources"] {
         let path = safe_join(project_path, rel)?;
@@ -1056,7 +1084,7 @@ fn list_public_roots(
             &path,
             recursive,
             max_files,
-            &mut count,
+            &mut budget,
             &mut roots,
         )?;
     }
@@ -1068,7 +1096,7 @@ fn list_tree(
     path: &Path,
     recursive: bool,
     max_files: usize,
-    count: &mut usize,
+    budget: &mut FileListingBudget,
 ) -> Result<Vec<ApiFileNode>, String> {
     let mut out = Vec::new();
     let entries = fs::read_dir(path).map_err(|e| format!("Failed to list directory: {e}"))?;
@@ -1079,7 +1107,7 @@ fn list_tree(
             &entry.path(),
             recursive,
             max_files,
-            count,
+            budget,
             &mut out,
         )?;
     }
@@ -1092,7 +1120,7 @@ fn push_file_node(
     path: &Path,
     recursive: bool,
     max_files: usize,
-    count: &mut usize,
+    budget: &mut FileListingBudget,
     out: &mut Vec<ApiFileNode>,
 ) -> Result<(), String> {
     let name = path
@@ -1108,13 +1136,10 @@ fn push_file_node(
     if file_type.is_symlink() {
         return Ok(());
     }
-    *count += 1;
-    if *count > max_files {
-        return Err(format!("File listing exceeds maxFiles limit ({max_files})"));
-    }
     let is_dir = file_type.is_dir();
+    budget.record(is_dir, max_files)?;
     let children = if recursive && is_dir {
-        Some(list_tree(project_path, path, true, max_files, count)?)
+        Some(list_tree(project_path, path, true, max_files, budget)?)
     } else {
         None
     };
@@ -2607,6 +2632,34 @@ mod tests {
         let joined = safe_join(&root_str, "wiki/index.md").unwrap();
         assert_eq!(joined, root.join("wiki/index.md"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_listing_budget_accepts_exactly_ten_thousand_files_and_rejects_one_more() {
+        let mut budget = FileListingBudget::default();
+        for _ in 0..HARD_MAX_FILES {
+            budget.record(false, HARD_MAX_FILES).unwrap();
+        }
+        assert_eq!(budget.files, HARD_MAX_FILES);
+        assert_eq!(
+            budget.record(false, HARD_MAX_FILES).unwrap_err(),
+            format!("File listing exceeds maxFiles limit ({HARD_MAX_FILES})")
+        );
+    }
+
+    #[test]
+    fn directory_nodes_do_not_consume_the_file_limit() {
+        let mut budget = FileListingBudget::default();
+        for _ in 0..HARD_MAX_FILES {
+            budget.record(true, 1).unwrap();
+        }
+        budget.record(false, 1).unwrap();
+        assert_eq!(budget.files, 1);
+        assert_eq!(budget.directories, HARD_MAX_FILES);
+        assert!(budget
+            .record(true, 1)
+            .unwrap_err()
+            .contains("directory safety limit"));
     }
 
     #[test]

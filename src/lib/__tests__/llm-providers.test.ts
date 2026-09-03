@@ -541,17 +541,12 @@ describe("Sampling override translation across wires", () => {
 //   TCP connection rather than 403, which surfaces as a generic
 //   reqwest error.
 //
-// Current strategy: ALWAYS send `Origin: http://localhost`
-// regardless of where the actual server is. Ollama's default
-// OLLAMA_ORIGINS unconditionally includes `http://localhost` (and
-// the related `127.0.0.1` / port-wildcard variants); LM Studio /
-// llama.cpp / vLLM don't check Origin at all. The header is purely
-// a CORS-allowlist signal — semantically lying about "where this
-// request came from" is fine because the server uses API keys (or
-// no auth), not origin, for actual permission checks.
+// Current strategy: loopback hosts use the configured endpoint origin;
+// RFC1918 LAN hosts keep the established `http://localhost` fallback
+// accepted by stock Ollama-compatible servers.
 
 describe("Origin header — local LLM CORS workaround", () => {
-  it("Ollama provider sends Origin: http://localhost when server is on localhost", () => {
+  it("Ollama provider sends the configured localhost origin", () => {
     const cfg = getProviderConfig({
       provider: "ollama",
       apiKey: "",
@@ -560,15 +555,10 @@ describe("Origin header — local LLM CORS workaround", () => {
       customEndpoint: "",
       maxContextSize: 8192,
     })
-    expect(cfg.headers["Origin"]).toBe("http://localhost")
+    expect(cfg.headers["Origin"]).toBe("http://localhost:11434")
   })
 
-  it("Ollama provider sends Origin: http://localhost EVEN WHEN server is on a remote LAN IP", () => {
-    // This is the v0.4.2 user-reported bug: previously the Origin
-    // mirrored the request URL's host (`http://192.168.1.50:11434`),
-    // which Ollama's default OLLAMA_ORIGINS doesn't include →
-    // request rejected. Forcing localhost makes any LAN deployment
-    // pass Ollama's CORS check.
+  it("Ollama provider preserves the localhost fallback for LAN hosts", () => {
     const cfg = getProviderConfig({
       provider: "ollama",
       apiKey: "",
@@ -589,7 +579,7 @@ describe("Origin header — local LLM CORS workaround", () => {
       customEndpoint: "",
       maxContextSize: 8192,
     })
-    expect(cfg.headers["Origin"]).toBe("http://localhost")
+    expect(cfg.headers["Origin"]).toBe("http://localhost:11434")
   })
 
   it("local custom OpenAI-compat endpoint gets the Origin override (LM Studio / llama.cpp / vLLM)", () => {
@@ -606,7 +596,7 @@ describe("Origin header — local LLM CORS workaround", () => {
       maxContextSize: 8192,
       apiMode: "chat_completions",
     } as RealLlmConfig)
-    expect(cfg.headers["Origin"]).toBe("http://localhost")
+    expect(cfg.headers["Origin"]).toBe("http://127.0.0.1:1234")
   })
 
   it("public custom OpenAI-compat endpoint does not get the local Origin override", () => {
@@ -637,11 +627,7 @@ describe("Origin header — local LLM CORS workaround", () => {
     expect(cfg.headers["Origin"]).toBeUndefined()
   })
 
-  it("Ollama provider always sets Origin even when the configured URL is malformed", () => {
-    // The fixed-string Origin doesn't depend on URL parsing, so a
-    // mistyped config can't strip the header. (The request itself
-    // will fail elsewhere because the URL is bad — that's not this
-    // helper's concern.)
+  it("does not invent an Origin when the configured URL is malformed", () => {
     const cfg = getProviderConfig({
       provider: "ollama",
       apiKey: "",
@@ -650,7 +636,7 @@ describe("Origin header — local LLM CORS workaround", () => {
       customEndpoint: "",
       maxContextSize: 8192,
     })
-    expect(cfg.headers["Origin"]).toBe("http://localhost")
+    expect(cfg.headers["Origin"]).toBeUndefined()
     expect(typeof cfg.url).toBe("string")
   })
 })

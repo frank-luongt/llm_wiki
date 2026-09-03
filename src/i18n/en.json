@@ -837,7 +837,7 @@
         "mcpEnable": "Enable MCP access",
         "mcpEnableHint": "MCP uses the local API and the same token rules. Keep the HTTP API enabled, then connect an MCP client to the bundled Node server.",
         "mcpUsage": "MCP usage",
-        "mcpUsageHint": "Build once with `npm run mcp:build`, then configure your MCP client to run the server below. Use LLM_WIKI_API_TOKEN unless unauthenticated access is enabled.",
+        "mcpUsageHint": "Build once with `npm run mcp:build`, then configure your MCP client to run the server below. Replace the LLM_WIKI_API_TOKEN placeholder: unauthenticated access applies only to read-oriented tools; chat and page embedding still require a token.",
         "mcpPathUnavailable": "MCP server entry was not found. Run `npm run mcp:build` from the LLM Wiki repository, then reopen Settings.",
         "token": "Access token",
         "tokenHint": "Send as `Authorization: Bearer <token>` or `X-LLM-Wiki-Token: <token>`. Read endpoints may omit it when unauthenticated access is enabled, but Agent chat, cancellation, and page embedding always require it. The environment variable LLM_WIKI_API_TOKEN overrides this field if set.",

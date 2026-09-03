@@ -104,41 +104,14 @@ export function mergeLlmRequestHeaders(
  * Origin header for local-LLM endpoints (Ollama, LM Studio, llama.cpp
  * server, LocalAI, vLLM, …).
  *
- * Always sets `Origin: http://localhost` regardless of where the
- * actual server is. Two interlocking reasons:
+ * Loopback and `.localhost` endpoints use their normalized endpoint
+ * origin. RFC1918 LAN endpoints keep the established `http://localhost`
+ * fallback required by stock Ollama-compatible servers.
  *
- *   1. We MUST override the platform default. `@tauri-apps/plugin-
- *      http` v2.5.x auto-injects the webview's own origin
- *      (`tauri://localhost` on macOS/Linux,
- *      `http://tauri.localhost` on Windows). Ollama's default
- *      `OLLAMA_ORIGINS` allowlist accepts `tauri://*` since ~0.1.30
- *      but NOT `http://tauri.localhost` — without our override,
- *      Windows users hit 403. (User packet capture v0.3.11.)
- *
- *   2. We can't override with the request's REAL origin because
- *      that breaks cross-machine LAN setups. A user pointing at
- *      `http://192.168.0.20:11434/v1` would get `Origin:
- *      http://192.168.0.20:11434`, which is NOT in Ollama's
- *      default OLLAMA_ORIGINS — Ollama then 403s or RST-closes
- *      the connection, surfacing as a generic "error sending
- *      request" reqwest error. The earlier code claimed Ollama
- *      did same-origin bypass; it does not. Reported by user
- *      v0.4.2.
- *
- * `http://localhost` is unconditionally in Ollama's default
- * OLLAMA_ORIGINS list (`http://localhost`, `http://localhost:*`,
- * `http://127.0.0.1*`, etc.). LM Studio / llama.cpp / vLLM /
- * LocalAI don't check Origin at all, so the value is ignored
- * there. The header is purely a CORS-allowlist signal — semantic
- * "where this request came from" is meaningless here because the
- * server uses API keys (or no auth), not origin, for actual
- * permission checks.
- *
- * Users who actively tightened OLLAMA_ORIGINS to remove localhost
- * (rare) need to re-add `http://localhost` to their server config;
- * no client-side fix can satisfy a hand-locked allowlist that
- * specifically excludes the one origin every other LLM client
- * also relies on.
+ * We MUST override the platform default because plugin-http can inject
+ * the webview origin (`tauri://localhost` or `http://tauri.localhost`),
+ * which is unrelated to the configured server and can fail strict
+ * local-server allowlists.
  *
  * Why this overrides at all: plugin-http's JS shim respects user-
  * set headers (see `node_modules/@tauri-apps/plugin-http/dist-js/
@@ -148,27 +121,30 @@ export function mergeLlmRequestHeaders(
  * `src-tauri/Cargo.toml` lets reqwest forward Origin without
  * stripping it. End-to-end our value wins.
  */
-export function localLlmOriginHeader(): Record<string, string> {
-  return { Origin: "http://localhost" }
-}
-
-export function isLocalOrPrivateHttpEndpoint(endpoint: string): boolean {
+export function localLlmOriginHeader(endpoint: string): Record<string, string> {
   try {
     const url = new URL(endpoint)
-    const host = url.hostname.toLowerCase()
-    if (host === "localhost" || host.endsWith(".localhost")) return true
-    if (host === "127.0.0.1" || host === "::1" || host === "[::1]") return true
-    if (/^10\./.test(host)) return true
-    if (/^192\.168\./.test(host)) return true
-    const m = host.match(/^172\.(\d+)\./)
-    if (m) {
-      const second = Number(m[1])
-      if (second >= 16 && second <= 31) return true
-    }
-    return false
+    if (url.protocol !== "http:" && url.protocol !== "https:") return {}
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "")
+    if (isLoopbackHostname(host)) return { Origin: url.origin }
+    if (isPrivateIpv4Hostname(host)) return { Origin: "http://localhost" }
+    return {}
   } catch {
+    return {}
+  }
+}
+
+function isLoopbackHostname(host: string): boolean {
+  return host === "localhost" || host.endsWith(".localhost") || host === "::1" || /^127\./.test(host)
+}
+
+function isPrivateIpv4Hostname(host: string): boolean {
+  const octets = host.split(".")
+  if (octets.length !== 4 || octets.some((octet) => !/^\d+$/.test(octet) || Number(octet) > 255)) {
     return false
   }
+  const [first, second] = octets.map(Number)
+  return first === 10 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168)
 }
 
 function parseOpenAiLine(line: string): string | null {
@@ -1014,7 +990,7 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
         url: `${ollamaBase}/v1/chat/completions`,
         headers: mergeLlmRequestHeaders(config.customHeaders, {
           "Content-Type": JSON_CONTENT_TYPE,
-          ...localLlmOriginHeader(),
+          ...localLlmOriginHeader(ollamaBase),
         }),
         buildBody: (messages, overrides) => ({
           ...buildOpenAiCompatibleBody(config, messages, overrides, streaming),
@@ -1110,7 +1086,7 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
           // llama.cpp, vLLM, LocalAI) need the Ollama-style Origin
           // workaround. Public custom gateways may reject unexpected
           // browser Origin headers, so leave them untouched.
-          ...(!azure && isLocalOrPrivateHttpEndpoint(url) ? localLlmOriginHeader() : {}),
+          ...(!azure ? localLlmOriginHeader(url) : {}),
         }),
         buildBody: (messages, overrides) => {
           const body = buildOpenAiCompatibleBody(config, messages, overrides, streaming)

@@ -837,7 +837,7 @@
         "mcpEnable": "Attiva l'accesso MCP",
         "mcpEnableHint": "MCP usa l'API locale e le stesse regole sul token. Tieni attiva l'API HTTP, poi collega un client MCP al server Node incluso.",
         "mcpUsage": "Uso di MCP",
-        "mcpUsageHint": "Compila una volta con `npm run mcp:build`, poi configura il tuo client MCP per avviare il server qui sotto. Usa LLM_WIKI_API_TOKEN a meno che non sia attivo l'accesso senza autenticazione.",
+        "mcpUsageHint": "Compila una volta con `npm run mcp:build`, poi configura il tuo client MCP per avviare il server qui sotto. Sostituisci il segnaposto LLM_WIKI_API_TOKEN: l'accesso senza autenticazione vale solo per gli strumenti di lettura; chat e indicizzazione delle pagine richiedono comunque un token.",
         "mcpPathUnavailable": "Entry point del server MCP non trovato. Esegui `npm run mcp:build` dal repository di LLM Wiki, poi riapri le Impostazioni.",
         "token": "Token di accesso",
         "tokenHint": "Invialo come `Authorization: Bearer <token>` oppure `X-LLM-Wiki-Token: <token>`. Gli endpoint di lettura possono ometterlo quando l'accesso senza autenticazione è attivo, ma chat Agent, annullamento e indicizzazione pagina richiedono sempre un token. LLM_WIKI_API_TOKEN ha la precedenza.",
